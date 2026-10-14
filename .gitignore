@@ -1,0 +1,28 @@
+# 个人配置（含本地 Cookie / 登录凭证，禁止提交）
+config.json
+
+# 下载产物
+downloads/
+
+# 打包发布目录（exe 通过 GitHub Release 分发）
+release/
+build/
+dist/
+*.spec
+
+# Python 缓存与构建中间产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 断点续传临时文件
+*.part
+
+# 编辑器 / IDE
+.trae/
+.vscode/
+.idea/
+
+# 系统文件
+Thumbs.db
+Desktop.ini

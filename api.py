@@ -180,6 +180,47 @@ class NetEaseAPI:
         """返回当前登录用户的 profile；未登录返回 None。"""
         return self._plain_get('/api/nuser/account/get').get('profile')
 
+    # ---------------- 我的歌单 / 我喜欢的音乐 ----------------
+    def _my_playlists_raw(self) -> tuple[int, list]:
+        """返回 (用户 ID, 歌单原始列表)。"""
+        profile = self.account()
+        if not profile:
+            raise RuntimeError('请先登录网易云账号')
+        uid = profile.get('userId')
+        res = self._plain_get('/api/user/playlist', {'uid': uid, 'limit': 1000, 'offset': 0})
+        return uid, (res.get('playlist') or [])
+
+    def user_playlists(self) -> list[dict]:
+        """返回当前账号的歌单，区分「我创建的」与「我收藏的」。"""
+        uid, playlists = self._my_playlists_raw()
+        result = []
+        for item in playlists:
+            creator = (item.get('creator') or {}).get('userId')
+            result.append({
+                'id': item.get('id'),
+                'title': item.get('name') or '',
+                'count': item.get('trackCount') or 0,
+                'cover': item.get('coverImgUrl') or '',
+                'kind': 'created' if creator == uid else 'fav',
+            })
+        return result
+
+    def liked_songs(self) -> tuple[str, list]:
+        """「我喜欢的音乐」用 specialType=5 标记定位，其歌单 ID 不等于用户 ID。"""
+        uid, playlists = self._my_playlists_raw()
+        special = next((item for item in playlists if item.get('specialType') == 5), None)
+        return self.playlist_songs(special.get('id') if special else uid)
+
+    def liked_keys(self) -> set:
+        """「我喜欢的音乐」的歌曲标识集合，元素形如 ('netease', 歌曲ID)。"""
+        uid, playlists = self._my_playlists_raw()
+        special = next((item for item in playlists if item.get('specialType') == 5), None)
+        if special is None:
+            return set()
+        detail = self.playlist_detail(special.get('id'))
+        return {('netease', int(item['id']))
+                for item in (detail.get('trackIds') or []) if item.get('id')}
+
     # ---------------- 扫码登录 ----------------
     def qrcode_unikey(self):
         return self._plain_get('/api/login/qrcode/unikey', {'type': 1}).get('unikey')

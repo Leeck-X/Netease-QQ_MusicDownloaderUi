@@ -1,5 +1,6 @@
 """下载器：取地址 → 流式下载 → 进度 → 重试 → 歌词 → 封面与标签。"""
 import os
+import threading
 import time
 
 import requests
@@ -15,12 +16,49 @@ class DownloadError(Exception):
     pass
 
 
+class DownloadCancelled(Exception):
+    """用户主动取消下载（不是失败，不参与重试）。"""
+
+
+class Control:
+    """下载暂停 / 取消控制，供界面线程与下载线程共享。"""
+
+    def __init__(self):
+        self._cancel = threading.Event()
+        self._pause = threading.Event()
+
+    @property
+    def paused(self) -> bool:
+        return self._pause.is_set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancel.is_set()
+
+    def pause(self) -> None:
+        self._pause.set()
+
+    def resume(self) -> None:
+        self._pause.clear()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+        self._pause.clear()   # 取消时先解除暂停，避免下载线程卡在等待
+
+    def wait_if_paused(self) -> None:
+        while self._pause.is_set() and not self._cancel.is_set():
+            time.sleep(0.1)
+
+
 class Downloader:
-    def __init__(self, api, cfg, on_log=None, on_progress=None):
+    def __init__(self, api, cfg, on_log=None, on_progress=None, control=None):
         self.api = api
         self.cfg = cfg
         self.on_log = on_log or (lambda message: None)
         self.on_progress = on_progress or (lambda ratio: None)
+        self.control = control or Control()
+        self.produced = []   # 本次已完成的文件（音频 / 歌词）
+        self.pending = None  # 正在下载的临时文件，完成后清空
 
     def download(self, song, level=None, encode_type=None, options=None) -> str:
         level = level or self.cfg['level']
@@ -28,6 +66,7 @@ class Downloader:
         options = options or {}
         out_dir = self.cfg['download_dir']
         os.makedirs(out_dir, exist_ok=True)
+        self._check_control()
 
         info = self.api.song_url(song, level, encode_type)
         url = info.get('url')
@@ -49,6 +88,8 @@ class Downloader:
                 self._fetch(url, path, song)
                 last_error = None
                 break
+            except DownloadCancelled:
+                raise
             except Exception as exc:  # noqa: BLE001 - 需要重试任何网络异常
                 last_error = exc
                 self.on_log(f'  第 {attempt} 次下载失败：{exc}')
@@ -64,26 +105,59 @@ class Downloader:
             self._write_tags(song, path, embed_cover)
 
         self.on_log(f'  已保存：{base}{ext}')
+        self._check_control()   # 取消请求若在收尾阶段到达，按取消处理
         return path
 
+    def cleanup(self) -> int:
+        """删除本次下载产生的文件（含未完成的 .part），返回删除数量。"""
+        removed = 0
+        targets = list(self.produced) + ([self.pending] if self.pending else [])
+        for path in targets:
+            try:
+                if path and os.path.exists(path):
+                    os.remove(path)
+                    removed += 1
+            except OSError as exc:  # noqa: BLE001 - 删除失败不影响主流程
+                self.on_log(f'  删除失败：{path}（{exc}）')
+        self.produced, self.pending = [], None
+        return removed
+
     # ---------------- 内部实现 ----------------
+    def _check_control(self) -> None:
+        """暂停时在此等待；取消时抛异常中断下载。"""
+        self.control.wait_if_paused()
+        if self.control.cancelled:
+            raise DownloadCancelled('已取消下载')
+
     def _fetch(self, url: str, path: str, song) -> None:
         referer = 'https://y.qq.com/' if getattr(song, 'source', 'netease') == 'qq' else 'https://music.163.com/'
         headers = {'User-Agent': UA, 'Referer': referer}
         session = getattr(self.api, 'session', None) or requests
         tmp_path = path + '.part'
+        self.pending = tmp_path
+        # 暂停后恢复下载：优先用 Range 续传已写入的部分
+        offset = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
+        if offset:
+            headers['Range'] = f'bytes={offset}-'
         with session.get(url, headers=headers, stream=True, timeout=30) as resp:
             resp.raise_for_status()
-            total = int(resp.headers.get('Content-Length') or 0)
-            done = 0
-            with open(tmp_path, 'wb') as handle:
+            if offset and resp.status_code != 206:   # 服务端不支持断点续传
+                offset = 0
+            total = (int(resp.headers.get('Content-Length') or 0) + offset)
+            done = offset
+            with open(tmp_path, 'ab' if offset else 'wb') as handle:
                 for chunk in resp.iter_content(CHUNK):
-                    if chunk:
-                        handle.write(chunk)
-                        done += len(chunk)
-                        if total:
-                            self.on_progress(min(done / total, 1.0))
+                    self._check_control()
+                    if not chunk:
+                        continue
+                    handle.write(chunk)
+                    done += len(chunk)
+                    if total:
+                        self.on_progress(min(done / total, 1.0))
+        self._check_control()
         os.replace(tmp_path, path)
+        self.pending = None
+        self.produced.append(path)
         self.on_progress(1.0)
 
     def _save_lyric(self, song, audio_path: str) -> None:
@@ -94,8 +168,10 @@ class Downloader:
                 return
             translated = data.get('trans') or ''
             content = lrc.rstrip() + ('\n\n' + translated.rstrip() if translated.strip() else '')
-            with open(os.path.splitext(audio_path)[0] + '.lrc', 'w', encoding='utf-8') as handle:
+            lrc_path = os.path.splitext(audio_path)[0] + '.lrc'
+            with open(lrc_path, 'w', encoding='utf-8') as handle:
                 handle.write(content)
+            self.produced.append(lrc_path)
         except Exception as exc:  # noqa: BLE001 - 歌词失败不影响主流程
             self.on_log(f'  歌词保存失败：{exc}')
 

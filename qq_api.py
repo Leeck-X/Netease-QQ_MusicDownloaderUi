@@ -104,6 +104,7 @@ class QQMusicAPI:
         jar = parse_cookie(cookie)
         uin = jar.get('uin') or jar.get('wxuin') or jar.get('luin') or ''
         key = jar.get('qm_keyst') or jar.get('qqmusic_key') or ''
+        euin = jar.get('euin') or ''   # 部分场景需要加密 UIN（我的歌单/我喜欢的音乐）
 
         def _clean(value: str) -> str:
             value = (value or '').strip().strip('"')
@@ -112,7 +113,8 @@ class QQMusicAPI:
         uin, key = _clean(uin), _clean(key)
         if not uin.isdigit() or not key:
             raise ValueError('cookie 中缺少 uin 或 qm_keyst / qqmusic_key')
-        self._credential = Credential(musicid=int(uin), str_musicid=uin, musickey=key, login_type=2)
+        self._credential = Credential(musicid=int(uin), str_musicid=uin, musickey=key,
+                                      encrypt_uin=euin, login_type=2)
 
         async def job(client):
             return await client.login.check_expired()
@@ -241,6 +243,57 @@ class QQMusicAPI:
 
         resp = self._run(job)
         return {'lyric': resp.lyric or '', 'trans': resp.trans or ''}
+
+    # ---------------- 我的歌单 / 我喜欢的音乐 ----------------
+    def _euin(self) -> str:
+        """我的歌单 / 我喜欢的音乐需要加密 UIN；扫码登录会带，Cookie 登录可能没有。"""
+        euin = self._credential.encrypt_uin
+        if not euin:
+            raise RuntimeError('当前登录凭证缺少加密 UIN，请改用扫码登录后重试')
+        return euin
+
+    def user_playlists(self) -> list[dict]:
+        """返回当前账号的歌单，区分「我创建的」与「我收藏的」。"""
+        if not self.is_logged_in():
+            raise RuntimeError('请先登录 QQ 音乐账号')
+        uin, euin = self._credential.musicid, self._euin()
+
+        async def job(client):
+            created = await client.execute(client.user.get_created_songlist(uin))
+            fav = await client.execute(client.user.get_fav_songlist(euin, page=1, num=1000))
+            return created, fav
+
+        created, fav = self._run(job)
+        result = []
+        for group, rows in (('created', getattr(created, 'playlists', None)),
+                            ('fav', getattr(fav, 'playlists', None))):
+            for item in (rows or []):
+                result.append({
+                    'id': item.id,
+                    'title': strip_highlight(item.title or ''),
+                    'count': item.songnum or 0,
+                    'cover': item.picurl or '',
+                    'kind': group,
+                })
+        return result
+
+    def liked_songs(self) -> tuple[str, list[Song]]:
+        """「我喜欢的音乐」：QQ 收藏单曲目录（dirid=201）。"""
+        if not self.is_logged_in():
+            raise RuntimeError('请先登录 QQ 音乐账号')
+        euin = self._euin()
+
+        async def job(client):
+            return await client.execute(client.user.get_fav_song(euin, page=1, num=1000))
+
+        resp = self._run(job)
+        songs = [Song.from_qq(item.model_dump()) for item in (getattr(resp, 'songs', None) or [])]
+        return '我喜欢的音乐', songs
+
+    def liked_keys(self) -> set:
+        """「我喜欢的音乐」的歌曲标识集合，元素形如 ('qq', songmid)。"""
+        _, songs = self.liked_songs()
+        return {('qq', song.mid) for song in songs if song.mid}
 
 
 _EVENT_NAMES = {
