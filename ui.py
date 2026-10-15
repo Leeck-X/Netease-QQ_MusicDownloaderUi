@@ -1,8 +1,11 @@
 """Tkinter 图形界面：登录栏 + 搜索页 + 歌单页 + 设置页 + 进度与日志。"""
+import concurrent.futures
 import io
+import json
 import os
 import queue
 import re
+import sys
 import threading
 import time
 import tkinter as tk
@@ -12,11 +15,59 @@ import qrcode
 import requests
 from PIL import Image, ImageTk
 
-import config as cfgmod
-from downloader import Control, DownloadCancelled, Downloader
+from downloader import Control, DownloadCancelled, Downloader, ProgressHub, fmt_speed
 from models import (ENCODE_LABELS, ENCODE_TYPES, LABEL_ENCODES,
                     LEVELS_BY_SOURCE, human_size)
 from providers import SOURCE_LABELS, SOURCES, get_provider
+
+# ---------------- 配置读写 ----------------
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, 'frozen', False):
+    # 打包为单文件 exe 后，__file__ 指向临时解包目录，
+    # 配置与下载目录应跟随 exe 所在目录，否则配置无法持久化。
+    APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
+CONFIG_PATH = os.path.join(APP_DIR, 'config.json')
+
+# 默认配置；凭证等敏感信息保存在同目录的 config.json 中，不写入源码
+DEFAULT_CONFIG = {
+    'source': 'netease',          # 当前音源：netease | qq
+    'cookie': '',                 # 网易云 cookie
+    'qq_credential': {},          # QQ 音乐登录凭证（Credential.model_dump）
+    'credentials': {},            # 网易云 API 凭证（随 exe 分发的 config.json 提供）
+    'download_dir': os.path.join(APP_DIR, 'downloads'),
+    'level': 'exhigh',
+    'encode_type': 'mp3',
+    'name_template': '{artist} - {name}',
+    'save_lyric': True,
+    'embed_tag': True,
+    'embed_cover': True,
+    'cover_fallback': True,
+    'skip_existing': True,
+    'retry': 3,
+    'workers': 3,                 # 并发下载线程数（1~8）
+    'cancel_cleanup': 'ask',      # 取消下载后：ask 每次询问 | delete 总是删除 | keep 总是保留
+    'use_anonimous': True,
+}
+
+
+def load_config() -> dict:
+    """读取同目录 config.json，缺失的字段用默认值补齐。"""
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))   # 深拷贝
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+                saved = json.load(f)
+            for key, value in saved.items():
+                cfg[key] = value
+        except (OSError, ValueError):
+            pass
+    return cfg
+
+
+def save_config(cfg: dict) -> None:
+    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
 
 # 列标题与列宽（表头可点击排序，勾选列除外）
 HEAD_LABELS = {'pick': '选', 'idx': '序号', 'name': '歌名', 'artist': '歌手',
@@ -42,11 +93,12 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title('音乐下载器（网易云 / QQ 音乐）')
-        self.geometry('1040x740')
-        self.minsize(900, 640)
-
-        self.cfg = cfgmod.load_config()
+        self.cfg = load_config()
         self.cfg.setdefault('source', 'netease')
+        self.minsize(880, 620)
+        # 记住上次窗口大小与位置，避免每次启动都要重新调整
+        self.geometry(self.cfg.get('window_geometry') or '1040x740')
+        self.protocol('WM_DELETE_WINDOW', self._on_close)
         self.api = get_provider(self.cfg['source'], self.cfg)
         self.msg_queue = queue.Queue()
         self.tree_songs = {}          # 树控件 -> 歌曲列表
@@ -60,34 +112,80 @@ class App(tk.Tk):
         self._search_busy = False     # 搜索分页：正在请求中（防止重复触发）
         self.pick_labels = {}         # 树控件 -> 已选计数标签
         self._sort_state = {}         # 树控件 -> (排序列, 是否倒序)
+        self._size_level = {}         # 树控件 -> 上次刷新「大小」列所用音质
+        self._liked_snapshot = {}     # 树控件 -> 上次刷新「喜欢」列所用集合
         self.liked_keys = set()       # 「我喜欢的音乐」标识集合（当前音源）
 
         self._build_top()
         self._build_tabs()
         self._build_bottom()
+        self._bind_shortcuts()
 
         self._poll_queue()
         self.after(400, lambda: self._bg(self._check_account))
+
+    def _on_close(self):
+        """关闭前保存窗口大小 / 位置，下次启动恢复。"""
+        try:
+            self.cfg['window_geometry'] = self.geometry()
+            save_config(self.cfg)
+        except Exception:  # noqa: BLE001 - 保存失败不应阻止关闭
+            pass
+        self.destroy()
+
+    def _bind_shortcuts(self):
+        """常用快捷键：Ctrl+F 定位搜索框，Ctrl+1/2/3 切换标签页。"""
+        self.bind('<Control-f>', lambda _event: self._focus_entry(self.search_entry))
+        self.bind('<Control-F>', lambda _event: self._focus_entry(self.search_entry))
+        self.bind('<Control-l>', lambda _event: self._focus_entry(self.playlist_entry))
+        self.bind('<Control-L>', lambda _event: self._focus_entry(self.playlist_entry))
+        for index, key in enumerate(('1', '2', '3')):
+            self.bind(f'<Control-Key-{key}>',
+                      lambda _event, i=index: self._select_tab(i))
+
+    def _focus_entry(self, entry):
+        self._select_tab(self.nb.index(self._tab_of(entry)))
+        entry.focus_set()
+        entry.select_range(0, 'end')
+
+    def _tab_of(self, widget):
+        """向上找到某个控件所属的标签页（master 为 notebook 的那层 Frame）。"""
+        node = widget
+        while node is not None and node.master is not self.nb:
+            node = node.master
+        return node
+
+    def _select_tab(self, index):
+        try:
+            self.nb.select(index)
+        except tk.TclError:
+            pass
 
     # ---------------- 界面构建 ----------------
     def _build_top(self):
         bar = ttk.Frame(self, padding=(10, 8))
         bar.pack(fill='x')
-        ttk.Label(bar, text='音源').pack(side='left')
+        # 登录信息列可伸缩，窗口变窄时优先压缩它，左右两侧控件始终不被挤出
+        bar.columnconfigure(3, weight=1)
+        ttk.Label(bar, text='音源').grid(row=0, column=0, sticky='w')
         self.source_var = tk.StringVar(value=SOURCE_LABELS[self.cfg['source']])
         source_box = ttk.Combobox(bar, textvariable=self.source_var, state='readonly',
                                   values=[label for _, label in SOURCES], width=12)
-        source_box.pack(side='left', padx=(4, 12))
+        source_box.grid(row=0, column=1, sticky='w', padx=(4, 12))
         source_box.bind('<<ComboboxSelected>>', lambda _event: self._switch_source())
         self.avatar_label = ttk.Label(bar)
-        self.avatar_label.pack(side='left', padx=(0, 8))
-        self.login_label = ttk.Label(bar, text='未登录（匿名模式）')
-        self.login_label.pack(side='left')
+        self.avatar_label.grid(row=0, column=2, sticky='w', padx=(0, 8))
+        self.login_label = ttk.Label(bar, text='未登录（匿名模式）', anchor='w')
+        self.login_label.grid(row=0, column=3, sticky='ew')
 
-        # 登录相关按钮按登录状态显隐，避免未登录时出现无效的「退出登录」
-        self.logout_btn = ttk.Button(bar, text='退出登录', command=self.do_logout)
-        self.cookie_btn = ttk.Button(bar, text='Cookie 登录', command=self.open_cookie_login)
-        self.qr_btn = ttk.Button(bar, text='扫码登录', command=self.open_qr_login)
+        # 登录按钮集中放在固定宽度的容器里，永不被登录信息挤掉
+        self.login_box = ttk.Frame(bar)
+        self.login_box.grid(row=0, column=4, sticky='e')
+
+        self.logout_btn = ttk.Button(self.login_box, text='退出登录', command=self.do_logout)
+        self.cookie_btn = ttk.Button(self.login_box, text='Cookie 登录',
+                                     command=self.open_cookie_login)
+        self.qr_btn = ttk.Button(self.login_box, text='扫码登录', command=self.open_qr_login)
         self._sync_login_buttons()
 
     def _sync_login_buttons(self):
@@ -98,17 +196,17 @@ class App(tk.Tk):
         for btn in (self.logout_btn, self.cookie_btn, self.qr_btn):
             btn.pack_forget()
         if self.logged_in:
-            self.logout_btn.pack(side='right', padx=4)
+            self.logout_btn.pack(side='left', padx=4)
         else:
-            self.qr_btn.pack(side='right', padx=4)
-            self.cookie_btn.pack(side='right', padx=4)
+            self.cookie_btn.pack(side='left', padx=4)
+            self.qr_btn.pack(side='left', padx=4)
 
     def _switch_source(self):
         source = next(s for s, label in SOURCES if label == self.source_var.get())
         if source == self.cfg['source']:
             return
         self.cfg['source'] = source
-        cfgmod.save_config(self.cfg)
+        save_config(self.cfg)
         self.api = get_provider(source, self.cfg)
         self.logged_in = bool(self.logged_sources.get(source))
         self.liked_keys = set()   # 音源变了，之前的「喜欢」集合作废
@@ -160,69 +258,80 @@ class App(tk.Tk):
         self.nb.add(tab, text='搜索')
         top = ttk.Frame(tab, padding=8)
         top.pack(fill='x')
-        ttk.Label(top, text='关键词').pack(side='left')
-        self.search_entry = ttk.Entry(top, width=42)
-        self.search_entry.pack(side='left', padx=6)
+        top.columnconfigure(0, weight=1)   # 输入行可伸缩，操作按钮组固定宽度
+        row = ttk.Frame(top)
+        row.grid(row=0, column=0, sticky='ew')
+        ttk.Label(row, text='关键词').pack(side='left')
+        # 先打包固定宽度控件，输入框最后打包并 expand：窗口变窄时优先压缩输入框
+        self.more_btn = ttk.Button(row, text='加载更多', command=self.load_more, state='disabled')
+        self.more_btn.pack(side='right', padx=(6, 0))
+        ttk.Button(row, text='搜索', command=self.do_search).pack(side='right')
+        self.search_entry = ttk.Entry(row)
+        self.search_entry.pack(side='left', fill='x', expand=True, padx=6)
         self.search_entry.bind('<Return>', lambda _event: self.do_search())
-        ttk.Button(top, text='搜索', command=self.do_search).pack(side='left')
-        self.more_btn = ttk.Button(top, text='加载更多', command=self.load_more, state='disabled')
-        self.more_btn.pack(side='left', padx=6)
         wrap = ttk.Frame(tab)
         wrap.pack(fill='both', expand=True, padx=8, pady=(0, 8))
         self.search_tree = self._make_song_tree(wrap)
-        self.sel_label = self._build_list_actions(top, self.search_tree)
+        self._build_list_actions(top, self.search_tree).grid(
+            row=0, column=1, sticky='e', padx=(10, 0))
 
     def _build_playlist_tab(self):
         tab = ttk.Frame(self.nb)
         self.nb.add(tab, text='歌单')
         top = ttk.Frame(tab, padding=8)
         top.pack(fill='x')
-        ttk.Label(top, text='歌单 ID 或链接').pack(side='left')
-        self.playlist_entry = ttk.Entry(top, width=42)
-        self.playlist_entry.pack(side='left', padx=6)
+        top.columnconfigure(0, weight=1)
+        row = ttk.Frame(top)
+        row.grid(row=0, column=0, sticky='ew')
+        ttk.Label(row, text='歌单 ID 或链接').pack(side='left')
+        ttk.Button(row, text='我喜欢', command=self.load_liked).pack(side='right', padx=(6, 0))
+        ttk.Button(row, text='我的歌单',
+                   command=self.open_my_playlists).pack(side='right')
+        ttk.Button(row, text='加载', command=self.do_load_playlist).pack(side='right')
+        self.playlist_entry = ttk.Entry(row)
+        self.playlist_entry.pack(side='left', fill='x', expand=True, padx=6)
         self.playlist_entry.bind('<Return>', lambda _event: self.do_load_playlist())
-        ttk.Button(top, text='加载', command=self.do_load_playlist).pack(side='left')
-        ttk.Button(top, text='我的歌单',
-                   command=self.open_my_playlists).pack(side='left', padx=(8, 0))
-        ttk.Button(top, text='我喜欢',
-                   command=self.load_liked).pack(side='left', padx=4)
         wrap = ttk.Frame(tab)
         wrap.pack(fill='both', expand=True, padx=8, pady=(0, 8))
         self.playlist_tree = self._make_song_tree(wrap)
-        self.sel_label_pl = self._build_list_actions(top, self.playlist_tree)
+        self._build_list_actions(top, self.playlist_tree).grid(
+            row=0, column=1, sticky='e', padx=(10, 0))
 
     def _build_list_actions(self, parent, tree):
         """搜索页 / 歌单页共用的列表操作区，保证两处交互完全一致。
-        自右向左依次打包，最终视觉顺序为：已选计数 · 去重 · 全选 · 清空 · 下载。"""
-        ttk.Button(parent, text='下载全部', command=self.download_all).pack(side='right', padx=4)
-        ttk.Button(parent, text='下载选中', command=self.download_selected).pack(side='right', padx=4)
-        ttk.Button(parent, text='清空勾选',
+        返回固定宽度的按钮组容器，由调用方右对齐放入网格：
+        视觉顺序为 已选计数 · 去重 · 全选 · 清空勾选 · 下载选中 · 下载全部。"""
+        holder = ttk.Frame(parent)
+        ttk.Button(holder, text='下载全部', command=self.download_all).pack(side='right', padx=4)
+        ttk.Button(holder, text='下载选中', command=self.download_selected).pack(side='right', padx=4)
+        ttk.Button(holder, text='清空勾选',
                    command=lambda: self._set_all_pick(tree, False)).pack(side='right', padx=4)
-        ttk.Button(parent, text='全选',
+        ttk.Button(holder, text='全选',
                    command=lambda: self._set_all_pick(tree, True)).pack(side='right', padx=4)
-        ttk.Button(parent, text='去重',
+        ttk.Button(holder, text='去重',
                    command=lambda: self._dedupe_tree(tree)).pack(side='right', padx=4)
-        sel_label = ttk.Label(parent, text='已选 0 首')
+        sel_label = ttk.Label(holder, text='已选 0 首')
         sel_label.pack(side='right', padx=(0, 10))
         self.pick_labels[str(tree)] = sel_label
-        return sel_label
+        return holder
 
     def _build_settings_tab(self):
         tab = ttk.Frame(self.nb, padding=16)
         self.nb.add(tab, text='设置')
         row = 0
+        tab.columnconfigure(1, weight=1)   # 输入区随窗口伸缩，窄窗口不溢出
 
         def line(label):
             nonlocal row
             ttk.Label(tab, text=label).grid(row=row, column=0, sticky='w', pady=7)
             holder = ttk.Frame(tab)
-            holder.grid(row=row, column=1, sticky='w')
+            holder.grid(row=row, column=1, sticky='ew')
             row += 1
             return holder
 
         holder = line('下载目录')
         self.dir_var = tk.StringVar(value=self.cfg['download_dir'])
-        ttk.Entry(holder, textvariable=self.dir_var, width=54).pack(side='left')
+        ttk.Entry(holder, textvariable=self.dir_var, width=30).pack(side='left', fill='x', expand=True)
         ttk.Button(holder, text='选择…', command=self._choose_dir).pack(side='left', padx=6)
 
         holder = line('编码格式')
@@ -235,12 +344,17 @@ class App(tk.Tk):
 
         holder = line('命名模板')
         self.tpl_var = tk.StringVar(value=self.cfg['name_template'])
-        ttk.Entry(holder, textvariable=self.tpl_var, width=54).pack(side='left')
+        ttk.Entry(holder, textvariable=self.tpl_var, width=30).pack(side='left', fill='x', expand=True)
         ttk.Label(holder, text='可用 {artist} {name} {album}').pack(side='left', padx=8)
 
         holder = line('失败重试次数')
         self.retry_var = tk.IntVar(value=int(self.cfg['retry']))
         ttk.Spinbox(holder, from_=0, to=10, textvariable=self.retry_var, width=6).pack(side='left')
+
+        holder = line('下载并发数')
+        self.workers_var = tk.IntVar(value=max(1, min(8, int(self.cfg.get('workers', 3)))))
+        ttk.Spinbox(holder, from_=1, to=8, textvariable=self.workers_var, width=6).pack(side='left')
+        ttk.Label(holder, text='同时下载的歌曲数（1~8，过大可能触发限速）').pack(side='left', padx=8)
 
         holder = line('取消下载后')
         self.cancel_cleanup_var = tk.StringVar(
@@ -263,17 +377,19 @@ class App(tk.Tk):
         bottom.pack(fill='x')
         line = ttk.Frame(bottom)
         line.pack(fill='x')
+        # 先打包右侧固定宽度控件（side='right'），进度条最后打包并 expand，
+        # 这样窗口变窄时被压缩的是进度条，而不是按钮被挤出
+        ttk.Button(line, text='清空日志', command=self._clear_log).pack(side='right', padx=6)
+        ttk.Button(line, text='打开下载目录', command=self._open_download_dir).pack(
+            side='right', padx=(0, 1))
+        self.cancel_btn = ttk.Button(line, text='取消', command=self._cancel_download, state='disabled')
+        self.cancel_btn.pack(side='right', padx=(0, 8))
+        self.pause_btn = ttk.Button(line, text='暂停', command=self._toggle_pause, state='disabled')
+        self.pause_btn.pack(side='right')
+        self.progress_label = ttk.Label(line, text='0%', width=14, anchor='e')
+        self.progress_label.pack(side='left', padx=(8, 10))
         self.progress = ttk.Progressbar(line, mode='determinate', maximum=100)
         self.progress.pack(side='left', fill='x', expand=True)
-        self.progress_label = ttk.Label(line, text='0%', width=5, anchor='e')
-        self.progress_label.pack(side='left', padx=(8, 0))
-        self.pause_btn = ttk.Button(line, text='暂停', command=self._toggle_pause, state='disabled')
-        self.pause_btn.pack(side='left', padx=(10, 0))
-        self.cancel_btn = ttk.Button(line, text='取消', command=self._cancel_download, state='disabled')
-        self.cancel_btn.pack(side='left', padx=6)
-        ttk.Button(line, text='打开下载目录', command=self._open_download_dir).pack(
-            side='left', padx=(10, 0))
-        ttk.Button(line, text='清空日志', command=self._clear_log).pack(side='left', padx=6)
         self.status_label = ttk.Label(bottom, text='就绪')
         self.status_label.pack(anchor='w', pady=(4, 0))
         log_frame = ttk.LabelFrame(self, text='日志')
@@ -342,8 +458,12 @@ class App(tk.Tk):
         elif kind == 'status':
             self.status_label.config(text=payload)
         elif kind == 'progress':
-            self.progress['value'] = payload * 100
-            self.progress_label.config(text=f'{int(payload * 100)}%')
+            ratio, speed = payload
+            self.progress['value'] = ratio * 100
+            text = f'{int(ratio * 100)}%'
+            if speed:
+                text += f' · {fmt_speed(speed)}'
+            self.progress_label.config(text=text)
         elif kind == 'songs':
             tree, songs = payload
             self._fill_tree(tree, songs)
@@ -500,12 +620,18 @@ class App(tk.Tk):
         self._append_log(f'已同步「我喜欢的音乐」：{len(data)} 首')
 
     def _refresh_likes(self, tree):
+        # 「喜欢」集合未变化时跳过全表重写，避免大列表无谓刷新卡顿
+        key = str(tree)
+        snapshot = frozenset(self.liked_keys)
+        if self._liked_snapshot.get(key) == snapshot:
+            return
+        self._liked_snapshot[key] = snapshot
         for iid in tree.get_children():
             song = self._song_at(tree, iid)
             if song is None:
                 continue
             values = list(tree.item(iid, 'values'))
-            values[8] = '♥' if song_key(song) in self.liked_keys else ''
+            values[8] = '♥' if song_key(song) in snapshot else ''
             tree.item(iid, values=values)
 
     def load_liked(self):
@@ -941,7 +1067,7 @@ class App(tk.Tk):
             self.cfg['embed_tag'] = options['embed_tag']
             self.cfg['embed_cover'] = options['embed_cover']
             self.cfg['skip_existing'] = bool(skip_var.get())
-            cfgmod.save_config(self.cfg)
+            save_config(self.cfg)
             self._refresh_sizes(self.search_tree)
             self._refresh_sizes(self.playlist_tree)
             win.destroy()
@@ -953,42 +1079,66 @@ class App(tk.Tk):
         ttk.Button(win, text='开始下载', command=confirm).pack(pady=14)
 
     def _download_worker(self, songs, level=None, options=None, control=None):
+        """多线程并发下载：线程数取自配置 workers（1~8）。
+
+        - 取址等接口调用在 Downloader 内部串行，下载传输并行
+        - ProgressHub 聚合整体进度与瞬时速度，UI 每秒最多刷新约 5 次
+        - 暂停 / 取消对所有下载线程同时生效
+        """
         control = control or Control()
+        workers = max(1, min(8, int(self.cfg.get('workers', 3))))
         downloader = Downloader(
             self.api, self.cfg,
             on_log=lambda text: self.msg_queue.put(('log', text)),
-            on_progress=lambda ratio: self.msg_queue.put(('progress', ratio)),
             control=control,
         )
         total = len(songs)
-        success = 0
-        failed = []
-        cancelled = False
-        try:
-            for index, song in enumerate(songs, 1):
-                if control.cancelled:
-                    cancelled = True
-                    break
-                control.wait_if_paused()
-                self.msg_queue.put(('status', f'[{index}/{total}] {song.name} - {song.artists}'))
-                self.msg_queue.put(('log', f'[{index}/{total}] {song.name} - {song.artists}'))
+        hub = ProgressHub(total, lambda ratio, speed:
+                          self.msg_queue.put(('progress', (ratio, speed))))
+        state = {'success': 0, 'failed': [], 'cancelled': False, 'done': 0}
+        lock = threading.Lock()
+
+        def task(index, song):
+            control.wait_if_paused()
+            if control.cancelled:
+                raise DownloadCancelled()
+            self.msg_queue.put(('log', f'[{index + 1}/{total}] {song.name} - {song.artists}'))
+            try:
+                downloader.download(song, level=level, options=options,
+                                     on_progress=lambda r, d, t, _i=index: hub.update(_i, r, d))
+                with lock:
+                    state['success'] += 1
+            except DownloadCancelled:
+                with lock:
+                    state['cancelled'] = True
+                raise
+            except Exception as exc:  # noqa: BLE001
+                with lock:
+                    state['failed'].append((song, str(exc)))
+                self.msg_queue.put(('log', f'  失败：{song.name} - {exc}'))
+            finally:
+                hub.finish(index)   # 无论成功 / 失败，该格都记满，保证整体进度单调
+                with lock:
+                    state['done'] += 1
+                    done_count = state['done']
+                self.msg_queue.put(('status', f'已完成 {done_count}/{total} · 并发 {workers} 线程'))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers,
+                                                   thread_name_prefix='dl') as pool:
+            futures = [pool.submit(task, i, song) for i, song in enumerate(songs)]
+            for future in concurrent.futures.as_completed(futures):
                 try:
-                    downloader.download(song, level=level, options=options)
-                    success += 1
+                    future.result()
                 except DownloadCancelled:
-                    cancelled = True
-                    self.msg_queue.put(('log', f'  已取消：{song.name} - {song.artists}'))
-                    break
-                except Exception as exc:  # noqa: BLE001
-                    failed.append((song, str(exc)))
-                    self.msg_queue.put(('log', f'  失败：{exc}'))
-                time.sleep(0.3)
-        finally:
-            # 收尾一律回到界面线程处理（含取消后的清理询问）
-            self.msg_queue.put(('download_end', {
-                'total': total, 'success': success, 'failed': failed,
-                'cancelled': cancelled, 'downloader': downloader,
-            }))
+                    pass   # 已在 task 内标记，未开始的任务也会快速退出
+                except Exception:  # noqa: BLE001 - 已在 task 内记录
+                    pass
+        hub.final()
+        # 收尾一律回到界面线程处理（含取消后的清理询问）
+        self.msg_queue.put(('download_end', {
+            'total': total, 'success': state['success'], 'failed': state['failed'],
+            'cancelled': state['cancelled'], 'downloader': downloader,
+        }))
 
     def _finish_download(self, payload):
         self._downloading = False
@@ -1013,13 +1163,13 @@ class App(tk.Tk):
 
     def _cleanup_after_cancel(self, downloader):
         """取消后按设置处理本次产生的文件（未完成的 .part 与已下载的音频/歌词）。"""
-        produced = list(downloader.produced)
-        pending = downloader.pending
+        produced = downloader.produced
+        pending = downloader.pending   # 多线程并发时可能有多个 .part
         if not produced and not pending:
             return
         setting = self.cfg.get('cancel_cleanup', 'ask')
         if setting == 'ask':
-            count = len(produced) + (1 if pending else 0)
+            count = len(produced) + len(pending)
             if not messagebox.askyesno(
                     '取消下载', f'本次共产生 {count} 个文件（含未完成）。\n是否删除？'):
                 self._append_log('已保留取消下载产生的文件')
@@ -1086,14 +1236,14 @@ class App(tk.Tk):
 
     def _apply_login(self, cookie):
         self.cfg['cookie'] = cookie
-        cfgmod.save_config(self.cfg)
+        save_config(self.cfg)
         self.api.set_cookie(cookie)
         self._append_log('网易云登录成功，Cookie 已写入 config.json')
         self._bg(self._check_account)
 
     def _on_qq_login(self):
         self.cfg['qq_credential'] = self.api.credential_dict()
-        cfgmod.save_config(self.cfg)
+        save_config(self.cfg)
         self._append_log('QQ 音乐登录成功，凭证已写入 config.json')
         self._bg(self._check_account)
 
@@ -1105,7 +1255,7 @@ class App(tk.Tk):
         else:
             self.cfg['cookie'] = ''
             self.api.set_cookie('')
-        cfgmod.save_config(self.cfg)
+        save_config(self.cfg)
         self.logged_sources[source] = None
         self.logged_in = False
         self.liked_keys = set()
@@ -1315,13 +1465,19 @@ class App(tk.Tk):
         self.cfg['encode_type'] = ENCODE_LABELS.get(self.encode_var.get(), 'mp3')
         self.cfg['name_template'] = self.tpl_var.get().strip() or '{artist} - {name}'
         self.cfg['retry'] = int(self.retry_var.get())
+        self.cfg['workers'] = max(1, min(8, int(self.workers_var.get())))
         self.cfg['cancel_cleanup'] = LABEL_CANCEL_CLEANUP.get(
             self.cancel_cleanup_var.get(), 'ask')
-        cfgmod.save_config(self.cfg)
+        save_config(self.cfg)
         self._append_log('设置已保存')
 
     def _refresh_sizes(self, tree, level=None):
         level = level or self.cfg.get('level', 'exhigh')
+        # 音质未变化时跳过全表重算，避免每次切换音源 / 刷新都重写整张表
+        key = str(tree)
+        if self._size_level.get(key) == level:
+            return
+        self._size_level[key] = level
         for iid in tree.get_children():
             song = self._song_at(tree, iid)
             if song is None:

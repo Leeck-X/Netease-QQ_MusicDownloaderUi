@@ -35,6 +35,11 @@
 - Cookie 登录、扫码登录（网易云与 QQ 均支持）
 - 顶部展示头像、昵称、ID、VIP 类型
 
+**界面与交互**
+- 控件随窗口自适应缩放，窗口变窄时优先压缩输入框 / 进度条，按钮不会被挤出
+- 窗口大小与位置自动记忆，下次启动恢复上次关闭时的状态
+- 快捷键：`Ctrl+F` 定位搜索框、`Ctrl+L` 定位歌单框、`Ctrl+1/2/3` 切换标签页
+
 ## 环境要求
 
 - Windows
@@ -49,8 +54,11 @@ python main.py
 
 ## 配置文件
 
-程序读取同目录下的 `config.json`（不存在时使用内置默认值，点击「保存设置」后写入）。
-已内置网易云 API 凭证，无需自行配置。**`config.json` 会保存你的登录 Cookie，请勿提交到公开仓库。**
+程序读取同目录下的 `config.json`（配置读写逻辑位于 `ui.py`）。网易云 API 凭证（app_id / app_secret / RSA 密钥对）也保存在 `config.json` 中，**源码内不含任何密钥**。
+
+发布包中的 `config.json` 已带好内置凭证，开箱即用；若该文件缺失，程序会以代码内的默认值启动（凭证为空，需自行补全后才能使用网易云接口）。
+
+**`config.json` 会保存你的登录 Cookie 与凭证，请勿提交到公开仓库。**
 
 ## 打包为单文件 exe
 
@@ -62,20 +70,20 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed --name MusicDownl
   --hidden-import qrcode.image.pil main.py
 ```
 
-生成的 `MusicDownloader.exe` 为单文件、静态链接，目标机器无需安装 Python。exe 运行时会以**自身所在目录**作为配置与下载目录，因此整个文件夹可随意移动。
+生成的 `MusicDownloader.exe` 为单文件、静态链接，目标机器无需安装 Python。exe 运行时会以**自身所在目录**作为配置与下载目录，因此整个文件夹可随意移动。发布时请将 `config.json` 与 exe 放在同一目录（发布包已包含）。
 
 ## 目录结构
 
 ```
 .
 ├── main.py            # 程序入口
-├── ui.py              # Tkinter 界面
+├── ui.py              # Tkinter 界面 + 配置读写
 ├── providers.py       # 音源工厂（网易云 / QQ）
 ├── api.py             # 网易云 Provider
 ├── qq_api.py          # QQ 音乐 Provider
 ├── downloader.py      # 下载器（进度 / 重试 / 暂停取消 / 标签歌词）
 ├── encrypt.py         # 网易云 weapi 加密
 ├── models.py          # 数据模型（Song 等）
-├── config.py          # 配置读写
+├── config.json        # 配置与内置凭证（不入库，随发布包分发）
 └── requirements.txt   # 依赖清单
 ```
