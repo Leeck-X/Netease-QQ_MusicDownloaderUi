@@ -54,9 +54,9 @@ class _LoopThread:
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
 
-    def run(self, coro):
-        """在后台循环里同步执行协程并返回结果（异常原样抛出）。"""
-        return asyncio.run_coroutine_threadsafe(coro, self.loop).result()
+    def run(self, coro, timeout=60):
+        """在后台循环里同步执行协程并返回结果（超时 / 异常原样抛出）。"""
+        return asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout)
 
 
 class QQMusicAPI:
@@ -208,6 +208,15 @@ class QQMusicAPI:
         title = strip_highlight(getattr(info, 'title', '') or '') if info is not None else ''
         songs = [Song.from_qq(item.model_dump()) for item in (resp.songs or [])]
         return title, songs
+
+    def song_by_id(self, value) -> list[Song]:
+        """按歌曲 ID / MID 取单曲详情（供粘贴单曲链接添加）。"""
+        async def job(client):
+            resp = await client.execute(client.song.get_detail(value))
+            return resp.track.model_dump()
+
+        raw = self._run(job)
+        return [Song.from_qq(raw)]
 
     def song_url(self, song: Song, level: str = 'exhigh', encode_type: str = 'mp3') -> dict:
         file_type = LEVEL_FILE_TYPES.get(level, SongFileType.MP3_320)

@@ -16,7 +16,7 @@ import qrcode
 import requests
 from PIL import Image
 
-from downloader import Control, DownloadCancelled, Downloader, ProgressHub
+from downloader import Control, DownloadCancelled, Downloader, ProgressHub, UA
 from models import LEVELS_BY_SOURCE, human_size
 
 # ---------------- 消息 tag ----------------
@@ -39,6 +39,8 @@ TAG_ACCOUNT = 'account'
 TAG_ERROR = 'error'
 
 PAGE_SIZE = 50   # 每次搜索 / 加载更多请求的条数
+QR_TIMEOUT = 180   # 扫码轮询总时长（秒）
+QR_INTERVAL = 2    # 扫码轮询间隔（秒）
 
 
 class ServiceHub:
@@ -96,6 +98,20 @@ class ServiceHub:
         except Exception as exc:  # noqa: BLE001
             self.post(TAG_LOG, f'歌单加载失败：{exc}')
 
+    def song_link_worker(self, value, tree):
+        """按单曲链接解析出的 ID / MID 取单曲并追加到列表。"""
+        try:
+            songs = self.get_api().song_by_id(value)
+        except Exception as exc:  # noqa: BLE001
+            self.post(TAG_LOG, f'单曲解析失败：{exc}')
+            return
+        if not songs:
+            self.post(TAG_LOG, '未找到该单曲（ID / MID 可能无效）')
+            return
+        self.post(TAG_APPEND_SONGS, (tree, songs))
+        song = songs[0]
+        self.post(TAG_LOG, f'已添加单曲：{song.name} - {song.artists}')
+
     # ---------------- 我的歌单 / 我喜欢的音乐 ----------------
     def liked_keys_worker(self):
         try:
@@ -125,7 +141,8 @@ class ServiceHub:
         image = None
         try:
             if song.cover_url:
-                resp = requests.get(song.cover_url, timeout=15)
+                resp = requests.get(song.cover_url, timeout=15, headers={'User-Agent': UA})
+                resp.raise_for_status()   # 错误页不是图片，避免被当作封面
                 image = Image.open(io.BytesIO(resp.content)).convert('RGB').resize((300, 300))
         except Exception as exc:  # noqa: BLE001
             self.post(TAG_LOG, f'封面加载失败：{exc}')
@@ -135,16 +152,30 @@ class ServiceHub:
         self.post(TAG_DETAIL_COVER, (win, label, image))
 
     def probe_qualities(self, song, label, win):
-        rows = []
+        """逐档探测可用音质；网易云各档独立，并发探测显著缩短等待。"""
         api = self.get_api()
         encode_type = self.get_cfg().get('encode_type', 'mp3')
-        for level, level_label in LEVELS_BY_SOURCE.get(song.source, LEVELS_BY_SOURCE['netease']):
+        levels = list(LEVELS_BY_SOURCE.get(song.source, LEVELS_BY_SOURCE['netease']))
+
+        def probe(level, level_label, session=None):
             try:
-                info = api.song_url(song, level, encode_type)
+                info = (api.song_url(song, level, encode_type, session=session)
+                        if session is not None else api.song_url(song, level, encode_type))
                 detail = f"{info.get('type', '').upper()} {human_size(info.get('size'))}"
-                rows.append(f'{level_label}：可用（{detail}）')
+                return f'{level_label}：可用（{detail}）'
             except Exception:  # noqa: BLE001 - 探测失败即视为不可用
-                rows.append(f'{level_label}：不可用')
+                return f'{level_label}：不可用'
+
+        # 网易云各档互不依赖，用克隆会话并发请求；QQ 走单线程事件循环，保持串行
+        if song.source == 'netease' and len(levels) > 1:
+            sessions = [api.clone_session() for _ in levels]
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=len(levels), thread_name_prefix='probe') as pool:
+                jobs = [pool.submit(probe, level, level_label, session)
+                        for (level, level_label), session in zip(levels, sessions)]
+                rows = [job.result() for job in jobs]
+        else:
+            rows = [probe(level, level_label) for level, level_label in levels]
         self.post(TAG_PROBE_DONE, (win, label, '\n'.join(rows)))
 
     # ---------------- 下载 ----------------
@@ -175,6 +206,7 @@ class ServiceHub:
             self.post(TAG_LOG, f'[{index + 1}/{total}] {song.name} - {song.artists}')
             try:
                 downloader.download(song, level=level, options=options,
+                                    index=index + 1,
                                     on_progress=lambda r, d, t, _i=index: hub.update(_i, r, d))
                 with lock:
                     state['success'] += 1
@@ -204,6 +236,7 @@ class ServiceHub:
                 except Exception:  # noqa: BLE001 - 已在 task 内记录
                     pass
         hub.final()
+        downloader.close()   # 释放本次下载持有的网络会话，避免连接池长期占用
         # 收尾一律回到界面线程处理（含取消后的清理询问）
         self.post(TAG_DOWNLOAD_END, {
             'total': total, 'success': state['success'], 'failed': state['failed'],
@@ -215,7 +248,9 @@ class ServiceHub:
         cfg = self.get_cfg()
         api = self.get_api()
         source = cfg.get('source', 'netease')
-        if source == 'netease' and cfg.get('use_anonimous') and not cfg.get('cookie'):
+        # 匿名 token 已存在时不再重复注册（退出登录清空 cookie 后 deviceId 消失，会重新注册）
+        if (source == 'netease' and cfg.get('use_anonimous') and not cfg.get('cookie')
+                and not api.session.cookies.get('deviceId')):
             try:
                 api.register_anonimous()
                 self.post(TAG_LOG, '匿名注册成功（已获取匿名 token）')
@@ -250,6 +285,22 @@ class ServiceHub:
         self.post(TAG_QQ_LOGIN_OK, None)
 
     # ---------------- 扫码登录 ----------------
+    def _poll_qr(self, should_stop, step):
+        """扫码轮询骨架：每 QR_INTERVAL 秒执行一次 step()，step 返回 True 表示流程结束。
+
+        网易云与 QQ 两个扫码 worker 共用此循环，避免重复维护超时与异常处理。
+        """
+        deadline = time.time() + QR_TIMEOUT
+        while not should_stop() and time.time() < deadline:
+            time.sleep(QR_INTERVAL)
+            if should_stop():
+                return
+            try:
+                if step():
+                    return
+            except Exception as exc:  # noqa: BLE001 - 轮询失败继续等待
+                self.post(TAG_LOG, f'轮询失败：{exc}')
+
     def qr_worker(self, win, label):
         api = self.get_api()
         try:
@@ -263,25 +314,22 @@ class ServiceHub:
         image = qrcode.make(f'https://music.163.com/login?codekey={unikey}').convert('RGB')
         self.post(TAG_QR_IMAGE, (win, label, image))
 
-        deadline = time.time() + 180
-        while not self.qr_stop and time.time() < deadline:
-            time.sleep(2)
-            try:
-                result = api.qrcode_check(unikey)
-            except Exception as exc:  # noqa: BLE001
-                self.post(TAG_LOG, f'轮询失败：{exc}')
-                continue
+        def step():
+            result = api.qrcode_check(unikey)
             code = result.get('code')
             if code == 800:
                 self.post(TAG_LOG, '二维码已过期，请重新获取')
-                return
+                return True
             if code == 802:
                 self.post(TAG_STATUS, '已扫码，请在手机上确认')
             elif code == 803:
                 cookie = result.get('cookie') or api.cookie_str()
                 self.post(TAG_LOGIN_OK, cookie)
                 self.post(TAG_CLOSE_QR, win)
-                return
+                return True
+            return False
+
+        self._poll_qr(lambda: self.qr_stop, step)
 
     def qq_qr_worker(self, win, label, hint, session, login_type):
         api = self.get_api()
@@ -299,22 +347,17 @@ class ServiceHub:
             return
         self.post(TAG_QR_IMAGE, (win, label, image))
 
-        deadline = time.time() + 180
-        while not session['stop'] and time.time() < deadline:
-            time.sleep(2)
-            if session['stop'] or not win.winfo_exists():
-                return
-            try:
-                event, note = api.qr_login_poll()
-            except Exception as exc:  # noqa: BLE001
-                self.post(TAG_LOG, f'轮询失败：{exc}')
-                continue
+        def step():
+            event, note = api.qr_login_poll()
             if event in ('scan', 'conf'):
                 self.post(TAG_PROBE_DONE, (win, hint, note))
             elif event == 'done':
                 self.post(TAG_QQ_LOGIN_OK, None)
                 self.post(TAG_CLOSE_QR, win)
-                return
+                return True
             elif event in ('timeout', 'refuse'):
                 self.post(TAG_PROBE_DONE, (win, hint, note))
-                return
+                return True
+            return False
+
+        self._poll_qr(lambda: session['stop'] or not win.winfo_exists(), step)

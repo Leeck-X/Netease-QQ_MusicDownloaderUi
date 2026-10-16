@@ -114,10 +114,11 @@ class Song:
         """按当前音质档位估算文件大小（详情接口的各码率 size）。"""
         return human_size(self.size_value(level))
 
-    def filename(self, template: str) -> str:
-        """按命名模板生成不含扩展名的文件名。"""
+    def filename(self, template: str, index: int = 0) -> str:
+        """按命名模板生成不含扩展名的文件名；index 对应模板里的 {index}（下载批内序号）。"""
         try:
-            return sanitize(template.format(artist=self.artists, name=self.name, album=self.album))
+            return sanitize(template.format(artist=self.artists, name=self.name,
+                                            album=self.album, index=index))
         except (KeyError, IndexError):
             return sanitize(f'{self.artists} - {self.name}')
 

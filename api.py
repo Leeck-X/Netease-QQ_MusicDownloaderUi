@@ -90,11 +90,14 @@ class NetEaseAPI:
                 return cookie.value
         return ''
 
-    def _weapi(self, path: str, payload: dict) -> dict:
-        """weapi 签名请求（加密 body）。"""
+    def _weapi(self, path: str, payload: dict, session=None) -> dict:
+        """weapi 签名请求（加密 body）。
+
+        session 给定时改用该会话发送，供并发请求避免共享 Session 竞争。
+        """
         params = {'csrf_token': self._csrf_token()}
-        resp = self.session.post(BASE + path, data=self._cipher.encrypt(payload),
-                                 params=params, timeout=20)
+        resp = (session or self.session).post(
+            BASE + path, data=self._cipher.encrypt(payload), params=params, timeout=20)
         resp.raise_for_status()
         return resp.json()
 
@@ -182,6 +185,18 @@ class NetEaseAPI:
                                 path=cookie.path or '/')
         return session
 
+    def clone_session(self):
+        """对外暴露的会话复制，供上层并发请求使用（避免并发共享 Session）。"""
+        return self._new_session_like()
+
+    def song_by_id(self, value) -> list:
+        """按歌曲 ID 取单曲（供粘贴单曲链接添加）。"""
+        try:
+            song_id = int(value)
+        except (TypeError, ValueError):
+            raise RuntimeError('歌曲 ID 无效')  # noqa: TRY003
+        return self.song_detail([song_id])
+
     def playlist_detail(self, playlist_id) -> dict:
         res = self._weapi('/weapi/v6/playlist/detail', {
             'id': playlist_id, 'n': 1000, 's': 8,
@@ -204,14 +219,15 @@ class NetEaseAPI:
             details = [Song.from_raw(item) for item in tracks]
         return title, details
 
-    def song_url(self, song, level: str = 'exhigh', encode_type: str = 'mp3') -> dict:
+    def song_url(self, song, level: str = 'exhigh', encode_type: str = 'mp3',
+                 session=None) -> dict:
         if level in ('lossless', 'hires'):
             encode_type = 'flac'
         res = self._weapi('/weapi/song/enhance/player/url/v1', {
             'ids': json.dumps([song.id]),
             'level': level,
             'encodeType': encode_type,
-        })
+        }, session=session)
         data = res.get('data') or []
         item = data[0] if data else {}
         if not item.get('url'):

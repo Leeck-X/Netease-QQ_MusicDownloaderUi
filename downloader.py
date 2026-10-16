@@ -10,11 +10,16 @@ from collections import deque
 
 import requests
 
-from models import TYPE_EXT
+from models import TYPE_EXT, sanitize
 
 CHUNK = 128 * 1024
 UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36')
+
+
+def _is_png(cover: bytes) -> bool:
+    """按 PNG 魔数判断封面格式，用于写出正确的 MIME（否则一律标成 JPEG 会与实际不符）。"""
+    return cover[:8] == b'\x89PNG\r\n\x1a\n'
 
 
 class DownloadError(Exception):
@@ -71,6 +76,9 @@ class Downloader:
         self._produced = []                # 已完成文件（音频 / 歌词）
         self._pending = set()              # 下载中的 .part 文件
         self._cover_session = requests.Session()  # 封面下载复用连接池
+        # 无会话音源（如 QQ）下载时复用的连接池；有会话的音源仍走其会话以保留登录 cookie
+        self._dl_session = requests.Session()
+        self._dl_session.headers.update({'User-Agent': UA})
 
     # ---- 线程安全的状态访问 ----
     @property
@@ -84,13 +92,11 @@ class Downloader:
             return set(self._pending)
 
     def download(self, song, level=None, encode_type=None, options=None,
-                 on_progress=None) -> str:
+                 on_progress=None, index: int = 0) -> str:
         progress = on_progress or self.on_progress
         level = level or self.cfg['level']
         encode_type = encode_type or self.cfg['encode_type']
         options = options or {}
-        out_dir = self.cfg['download_dir']
-        os.makedirs(out_dir, exist_ok=True)
         self._check_control()
 
         # 取址走接口会话，多线程下串行调用（耗时可忽略，下载本身仍是并行的）
@@ -101,11 +107,11 @@ class Downloader:
             raise DownloadError('无版权或该音质不可用')
 
         ext = TYPE_EXT.get((info.get('type') or '').lower(), '.mp3')
-        base = song.filename(self.cfg['name_template'])
-        path = os.path.join(out_dir, base + ext)
+        path = self._target_path(song, ext, index)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
 
         if self.cfg.get('skip_existing') and os.path.exists(path) and os.path.getsize(path) > 0:
-            self.on_log(f'  跳过（已存在）：{base}{ext}')
+            self.on_log(f'  跳过（已存在）：{self._rel_name(path)}')
             return path
 
         retry = int(self.cfg.get('retry', 3))
@@ -127,16 +133,43 @@ class Downloader:
             raise DownloadError(f'下载失败：{last_error}')
 
         # 单次下载选项优先于全局配置
-        if options.get('save_lyric', self.cfg.get('save_lyric')):
+        want_lyric = options.get('save_lyric', self.cfg.get('save_lyric'))
+        embed_tag = options.get('embed_tag', self.cfg.get('embed_tag'))
+        embed_cover = options.get('embed_cover', self.cfg.get('embed_cover'))
+        embed_lyric = options.get('embed_lyric', self.cfg.get('embed_lyric'))
+        # 需要写 .lrc 或嵌入标签时只取一次歌词，避免重复请求
+        lyric_text = ''
+        if want_lyric or embed_lyric:
             with self._api_lock:
-                self._save_lyric(song, path)
-        if options.get('embed_tag', self.cfg.get('embed_tag')):
-            embed_cover = options.get('embed_cover', self.cfg.get('embed_cover'))
-            self._write_tags(song, path, embed_cover)
+                lyric_text = self._fetch_lyric(song)
+        if want_lyric and lyric_text:
+            self._save_lyric_file(path, lyric_text)
+        if embed_tag or embed_cover or embed_lyric:
+            self._write_tags(song, path, embed_cover,
+                             lyric_text if embed_lyric else '')
 
-        self.on_log(f'  已保存：{base}{ext}')
+        self.on_log(f'  已保存：{self._rel_name(path)}')
         self._check_control()   # 取消请求若在收尾阶段到达，按取消处理
         return path
+
+    def _target_path(self, song, ext: str, index: int) -> str:
+        """按命名模板 + 文件组织方式生成完整保存路径（子目录不存在时由调用方创建）。"""
+        out_dir = self.cfg['download_dir']
+        structure = self.cfg.get('folder_structure', 'none')
+        folders = []
+        if structure in ('artist', 'artist_album'):
+            folders.append(sanitize(song.artists or '未知歌手'))
+        if structure in ('album', 'artist_album'):
+            folders.append(sanitize(song.album or '未知专辑'))
+        base = song.filename(self.cfg['name_template'], index)
+        return os.path.join(out_dir, *folders, base + ext)
+
+    def _rel_name(self, path: str) -> str:
+        """相对下载目录展示文件名（分文件夹后带子目录路径，日志更清晰）。"""
+        try:
+            return os.path.relpath(path, self.cfg['download_dir'])
+        except ValueError:  # 跨盘符时 relpath 会失败，退回文件名
+            return os.path.basename(path)
 
     def cleanup(self) -> int:
         """删除本次下载产生的文件（含未完成的 .part），返回删除数量。"""
@@ -153,6 +186,14 @@ class Downloader:
                 self.on_log(f'  删除失败：{path}（{exc}）')
         return removed
 
+    def close(self) -> None:
+        """释放下载器自己持有的网络会话（音源会话由其 Provider 长期持有，不在此关闭）。"""
+        for session in (self._cover_session, self._dl_session):
+            try:
+                session.close()
+            except Exception:  # noqa: BLE001 - 关闭失败不影响主流程
+                pass
+
     # ---------------- 内部实现 ----------------
     def _check_control(self) -> None:
         """暂停时在此等待；取消时抛异常中断下载。"""
@@ -163,7 +204,7 @@ class Downloader:
     def _fetch(self, url: str, path: str, song, progress, resume: bool = False) -> None:
         referer = 'https://y.qq.com/' if getattr(song, 'source', 'netease') == 'qq' else 'https://music.163.com/'
         headers = {'User-Agent': UA, 'Referer': referer}
-        session = getattr(self.api, 'session', None) or requests
+        session = getattr(self.api, 'session', None) or self._dl_session
         tmp_path = path + '.part'
         with self._lock:
             # 失败 / 取消时 .part 保留在 pending：重试可 Range 续传，取消清理时可删除
@@ -204,14 +245,22 @@ class Downloader:
             self._produced.append(path)
         progress(1.0, done, done)
 
-    def _save_lyric(self, song, audio_path: str) -> None:
+    def _fetch_lyric(self, song) -> str:
+        """取歌词文本（原文 + 翻译，若有）；失败返回空串，不影响主流程。"""
         try:
             data = self.api.lyric(song)
-            lrc = data.get('lyric') or ''
-            if not lrc.strip():
-                return
-            translated = data.get('trans') or ''
-            content = lrc.rstrip() + ('\n\n' + translated.rstrip() if translated.strip() else '')
+        except Exception as exc:  # noqa: BLE001 - 歌词失败不影响主流程
+            self.on_log(f'  歌词获取失败：{exc}')
+            return ''
+        lrc = (data.get('lyric') or '').rstrip()
+        if not lrc.strip():
+            return ''
+        translated = (data.get('trans') or '').rstrip()
+        return lrc + ('\n\n' + translated if translated.strip() else '')
+
+    def _save_lyric_file(self, audio_path: str, content: str) -> None:
+        """把歌词写成与音频同名的 .lrc 文件。"""
+        try:
             lrc_path = os.path.splitext(audio_path)[0] + '.lrc'
             with open(lrc_path, 'w', encoding='utf-8') as handle:
                 handle.write(content)
@@ -220,27 +269,30 @@ class Downloader:
         except Exception as exc:  # noqa: BLE001 - 歌词失败不影响主流程
             self.on_log(f'  歌词保存失败：{exc}')
 
-    def _write_tags(self, song, path: str, embed_cover: bool = True) -> None:
+    def _write_tags(self, song, path: str, embed_cover: bool = True,
+                    lyric: str = '') -> None:
         try:
             cover = b''
             if embed_cover and song.cover_url:
-                cover = self._cover_session.get(
+                resp = self._cover_session.get(
                     song.cover_url, timeout=15,
                     headers={'User-Agent': UA, 'Referer': 'https://y.qq.com/'}
-                    if song.source == 'qq' else {'User-Agent': UA}).content
+                    if song.source == 'qq' else {'User-Agent': UA})
+                resp.raise_for_status()   # 错误页不是图片，避免被当作封面嵌入
+                cover = resp.content
             ext = os.path.splitext(path)[1].lower()
             if ext == '.mp3':
-                self._tag_mp3(path, song, cover)
+                self._tag_mp3(path, song, cover, lyric)
             elif ext == '.flac':
-                self._tag_flac(path, song, cover)
+                self._tag_flac(path, song, cover, lyric)
             elif ext == '.m4a':
-                self._tag_m4a(path, song, cover)
+                self._tag_m4a(path, song, cover, lyric)
         except Exception as exc:  # noqa: BLE001 - 标签失败不影响文件可用
             self.on_log(f'  标签写入失败：{exc}')
 
     @staticmethod
-    def _tag_mp3(path: str, song, cover: bytes) -> None:
-        from mutagen.id3 import APIC, ID3, ID3NoHeaderError, TALB, TIT2, TPE1
+    def _tag_mp3(path: str, song, cover: bytes, lyric: str = '') -> None:
+        from mutagen.id3 import APIC, ID3, ID3NoHeaderError, TALB, TIT2, TPE1, USLT
         try:
             tags = ID3(path)
         except ID3NoHeaderError:
@@ -251,36 +303,45 @@ class Downloader:
         tags.add(TPE1(encoding=3, text=song.artists))
         tags.delall('TALB')
         tags.add(TALB(encoding=3, text=song.album))
+        if lyric:
+            tags.delall('USLT')
+            tags.add(USLT(encoding=3, lang='eng', desc='', text=lyric))
         if cover:
             tags.delall('APIC')
-            tags.add(APIC(encoding=3, mime='image/jpeg', type=3, desc='Cover', data=cover))
+            tags.add(APIC(encoding=3, mime='image/png' if _is_png(cover) else 'image/jpeg',
+                          type=3, desc='Cover', data=cover))
         tags.save(path)
 
     @staticmethod
-    def _tag_flac(path: str, song, cover: bytes) -> None:
+    def _tag_flac(path: str, song, cover: bytes, lyric: str = '') -> None:
         from mutagen.flac import FLAC, Picture
         audio = FLAC(path)
         audio['title'] = song.name
         audio['artist'] = song.artists
         audio['album'] = song.album
+        if lyric:
+            audio['LYRICS'] = lyric
         if cover:
             picture = Picture()
             picture.type = 3
-            picture.mime = 'image/jpeg'
+            picture.mime = 'image/png' if _is_png(cover) else 'image/jpeg'
             picture.data = cover
             audio.clear_pictures()
             audio.add_picture(picture)
         audio.save()
 
     @staticmethod
-    def _tag_m4a(path: str, song, cover: bytes) -> None:
+    def _tag_m4a(path: str, song, cover: bytes, lyric: str = '') -> None:
         from mutagen.mp4 import MP4, MP4Cover
         audio = MP4(path)
         audio['\xa9nam'] = song.name
         audio['\xa9ART'] = song.artists
         audio['\xa9alb'] = song.album
+        if lyric:
+            audio['\xa9lyr'] = lyric
         if cover:
-            audio['covr'] = [MP4Cover(cover, imageformat=MP4Cover.FORMAT_JPEG)]
+            imageformat = MP4Cover.FORMAT_PNG if _is_png(cover) else MP4Cover.FORMAT_JPEG
+            audio['covr'] = [MP4Cover(cover, imageformat=imageformat)]
         audio.save()
 
 

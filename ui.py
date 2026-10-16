@@ -39,15 +39,18 @@ DEFAULT_CONFIG = {
     'level': 'exhigh',
     'encode_type': 'mp3',
     'name_template': '{artist} - {name}',
+    'folder_structure': 'none',   # 文件组织：none | artist | album | artist_album
     'save_lyric': True,
     'embed_tag': True,
     'embed_cover': True,
+    'embed_lyric': True,          # 把歌词写入音频标签（除 .lrc 外）
     'cover_fallback': True,
     'skip_existing': True,
     'retry': 3,
     'workers': 3,                 # 并发下载线程数（1~8）
     'cancel_cleanup': 'ask',      # 取消下载后：ask 每次询问 | delete 总是删除 | keep 总是保留
     'open_dir_after_download': False,   # 下载成功后自动打开下载目录
+    'notify_on_finish': True,     # 下载结束后弹出通知浮窗 + 提示音
     'use_anonimous': True,
 }
 
@@ -89,10 +92,24 @@ PRELOAD_ROWS = 50    # 视口下方剩余不足该行数时，自动预加载下
 CANCEL_CLEANUP_LABELS = {'ask': '每次询问', 'delete': '总是删除文件', 'keep': '总是保留文件'}
 LABEL_CANCEL_CLEANUP = {label: key for key, label in CANCEL_CLEANUP_LABELS.items()}
 
+# 文件组织方式（设置页可选）：值 -> 中文标签
+FOLDER_STRUCTURE_LABELS = {
+    'none': '不分文件夹',
+    'artist': '按歌手分文件夹',
+    'album': '按专辑分文件夹',
+    'artist_album': '按歌手 / 专辑分两级',
+}
+LABEL_FOLDER_STRUCTURE = {label: key for key, label in FOLDER_STRUCTURE_LABELS.items()}
+
 
 def song_key(song):
     """去重用的歌曲标识：QQ 用 media/songmid，网易云用 id。"""
     return (song.source, song.mid or song.id)
+
+
+def song_haystack(song) -> str:
+    """过滤用的检索文本（歌名 / 歌手 / 专辑），统一小写便于匹配。"""
+    return f'{song.name} {song.artists} {song.album}'.lower()
 
 
 class App(tk.Tk):
@@ -107,20 +124,27 @@ class App(tk.Tk):
         self.protocol('WM_DELETE_WINDOW', self._on_close)
         self.api = get_provider(self.cfg['source'], self.cfg)
         self.msg_queue = queue.Queue()
-        self.tree_songs = {}          # 树控件 -> 歌曲列表
-        self._orig_index = {}         # 树控件 -> {歌曲标识: 原始载入序号}（供「序号」列排序）
-        self._pick_count = {}         # 树控件 -> 已勾选数量（增量维护，避免每次全表统计）
+        self.tree_songs = {}          # 树控件 -> 当前显示的歌曲列表（过滤 / 排序后）
+        self._all_songs = {}          # 树控件 -> 全部已载入歌曲（过滤与排序的基准，保持载入顺序）
+        self._picked_keys = {}        # 树控件 -> 已勾选歌曲标识集合（不随行号重建而失效）
+        self._tree_seen = {}          # 树控件 -> 已载入歌曲标识集合（去重，避免每次追加重建）
+        self._filters = {}            # 树控件 -> 当前过滤关键词（小写）
+        self._filter_vars = {}        # 树控件 -> 过滤输入框变量
+        self._filter_jobs = {}        # 树控件 -> 待执行的过滤防抖任务 id
         self._downloading = False
         self._dl_control = None       # 当前下载的暂停/取消控制
+        self._has_more = False        # 搜索结果是否还有下一页（供滚动预加载判断，免每次读控件状态）
         self.logged_in = False        # 当前音源是否已登录
         self.logged_sources = {}      # 音源 -> 登录 profile（用于下载前校验）
         # 后台服务层：线程调度与消息投递，worker 实现见 services.py
         self.hub = ServiceHub(self.msg_queue, lambda: self.cfg, lambda: self.api)
         self.pick_labels = {}         # 树控件 -> 已选计数标签
-        self._sort_state = {}         # 树控件 -> (排序列, 是否倒序)
+        self.stats_labels = {}        # 树控件 -> 列表统计标签（首数 · 总时长 · 总大小）
+        self._sort_state = {}         # 树控件 -> (排序列, 状态)；状态 0 原序 / 1 升序 / 2 降序
         self._size_level = {}         # 树控件 -> 上次刷新「大小」列所用音质
         self._liked_snapshot = {}     # 树控件 -> 上次刷新「喜欢」列所用集合
         self.liked_keys = set()       # 「我喜欢的音乐」标识集合（当前音源）
+        self._liked_loaded_source = None   # 已加载「喜欢」集合的音源，避免重复拉取
         # 消息 tag -> 处理函数（主线程分派，见 _handle）
         self._handlers = {
             TAG_LOG: self._append_log,
@@ -236,6 +260,7 @@ class App(tk.Tk):
         self.api = get_provider(source, self.cfg)
         self.logged_in = bool(self.logged_sources.get(source))
         self.liked_keys = set()   # 音源变了，之前的「喜欢」集合作废
+        self._liked_loaded_source = None   # 新音源需重新拉取「喜欢」集合
         self._refresh_likes(self.search_tree)
         self._refresh_likes(self.playlist_tree)
         self._sync_login_buttons()
@@ -295,8 +320,9 @@ class App(tk.Tk):
         self.search_entry.pack(side='left', fill='x', expand=True, padx=6)
         self.search_entry.bind('<Return>', lambda _event: self.do_search())
         wrap = ttk.Frame(tab)
-        wrap.pack(fill='both', expand=True, padx=8, pady=(0, 8))
         self.search_tree = self._make_song_tree(wrap)
+        self._build_filter_row(tab, self.search_tree)
+        wrap.pack(fill='both', expand=True, padx=8, pady=(0, 8))
         self._build_list_actions(top, self.search_tree).grid(
             row=0, column=1, sticky='e', padx=(10, 0))
 
@@ -308,17 +334,18 @@ class App(tk.Tk):
         top.columnconfigure(0, weight=1)
         row = ttk.Frame(top)
         row.grid(row=0, column=0, sticky='ew')
-        ttk.Label(row, text='歌单 ID 或链接').pack(side='left')
+        ttk.Label(row, text='歌单 / 单曲 链接或 ID').pack(side='left')
         ttk.Button(row, text='我喜欢', command=self.load_liked).pack(side='right', padx=(6, 0))
         ttk.Button(row, text='我的歌单',
                    command=self.open_my_playlists).pack(side='right')
-        ttk.Button(row, text='加载', command=self.do_load_playlist).pack(side='right')
+        ttk.Button(row, text='加载 / 添加', command=self.do_load_playlist).pack(side='right')
         self.playlist_entry = ttk.Entry(row)
         self.playlist_entry.pack(side='left', fill='x', expand=True, padx=6)
         self.playlist_entry.bind('<Return>', lambda _event: self.do_load_playlist())
         wrap = ttk.Frame(tab)
-        wrap.pack(fill='both', expand=True, padx=8, pady=(0, 8))
         self.playlist_tree = self._make_song_tree(wrap)
+        self._build_filter_row(tab, self.playlist_tree)
+        wrap.pack(fill='both', expand=True, padx=8, pady=(0, 8))
         self._build_list_actions(top, self.playlist_tree).grid(
             row=0, column=1, sticky='e', padx=(10, 0))
 
@@ -339,6 +366,38 @@ class App(tk.Tk):
         sel_label.pack(side='right', padx=(0, 10))
         self.pick_labels[tree] = sel_label
         return holder
+
+    def _build_filter_row(self, tab, tree):
+        """过滤行：输入即按 歌名/歌手/专辑 过滤当前列表，右侧显示统计。"""
+        row = ttk.Frame(tab, padding=(8, 0, 8, 4))
+        row.pack(fill='x')
+        ttk.Label(row, text='过滤').pack(side='left')
+        var = tk.StringVar()
+        entry = ttk.Entry(row, textvariable=var)
+        stats = ttk.Label(row, text='', foreground='#666')
+        stats.pack(side='right')
+        ttk.Button(row, text='清空', width=6,
+                   command=lambda: var.set('')).pack(side='right', padx=(6, 0))
+        entry.pack(side='left', fill='x', expand=True, padx=6)
+        self._filters[tree] = ''
+        self._filter_vars[tree] = var
+        self.stats_labels[tree] = stats
+        var.trace_add('write', lambda *_args, t=tree: self._schedule_filter(t))
+
+    def _schedule_filter(self, tree):
+        """过滤输入防抖：连续输入只在停顿后重建一次列表，避免大列表逐键卡顿。"""
+        job = self._filter_jobs.pop(tree, None)
+        if job is not None:
+            self.after_cancel(job)
+        self._filter_jobs[tree] = self.after(220, lambda: self._apply_filter(tree))
+
+    def _apply_filter(self, tree):
+        self._filter_jobs.pop(tree, None)
+        keyword = self._filter_vars[tree].get().strip().lower()
+        if self._filters.get(tree) == keyword:
+            return
+        self._filters[tree] = keyword
+        self._render_tree(tree)
 
     def _build_settings_tab(self):
         tab = ttk.Frame(self.nb, padding=16)
@@ -370,7 +429,15 @@ class App(tk.Tk):
         holder = line('命名模板')
         self.tpl_var = tk.StringVar(value=self.cfg['name_template'])
         ttk.Entry(holder, textvariable=self.tpl_var, width=30).pack(side='left', fill='x', expand=True)
-        ttk.Label(holder, text='可用 {artist} {name} {album}').pack(side='left', padx=8)
+        ttk.Label(holder, text='可用 {artist} {name} {album} {index}').pack(side='left', padx=8)
+
+        holder = line('文件组织')
+        self.folder_var = tk.StringVar(
+            value=FOLDER_STRUCTURE_LABELS.get(self.cfg.get('folder_structure', 'none'),
+                                              FOLDER_STRUCTURE_LABELS['none']))
+        ttk.Combobox(holder, textvariable=self.folder_var, state='readonly',
+                     values=list(FOLDER_STRUCTURE_LABELS.values()), width=22).pack(side='left')
+        ttk.Label(holder, text='在下载目录下按歌手 / 专辑建子目录').pack(side='left', padx=8)
 
         holder = line('失败重试次数')
         self.retry_var = tk.IntVar(value=int(self.cfg['retry']))
@@ -393,6 +460,9 @@ class App(tk.Tk):
         self.open_dir_var = tk.BooleanVar(value=bool(self.cfg.get('open_dir_after_download')))
         ttk.Checkbutton(holder, text='自动打开下载目录',
                         variable=self.open_dir_var).pack(side='left')
+        self.notify_var = tk.BooleanVar(value=bool(self.cfg.get('notify_on_finish')))
+        ttk.Checkbutton(holder, text='弹出完成通知',
+                        variable=self.notify_var).pack(side='left', padx=(12, 0))
 
         holder = line('高级密钥')
         ttk.Button(holder, text='加密密钥与 API 凭证…',
@@ -482,10 +552,18 @@ class App(tk.Tk):
         self.after(100, self._poll_queue)
 
     def _handle(self, kind, payload):
-        """主线程消息分派：查表调用对应处理函数（见 __init__ 的 _handlers）。"""
+        """主线程消息分派：查表调用对应处理函数（见 __init__ 的 _handlers）。
+
+        单个消息处理异常只记录日志，不向 drain 抛出：否则会中断本轮消息消费，
+        并让 _poll_queue 末尾的重排 after 跑不到，导致消息轮询永久停止。
+        """
         handler = self._handlers.get(kind)
-        if handler is not None:
+        if handler is None:
+            return
+        try:
             handler(payload)
+        except Exception as exc:  # noqa: BLE001 - 单条消息异常不应中断消息轮询
+            self._append_log(f'处理「{kind}」消息出错：{exc}')
 
     def _set_status(self, text):
         self.status_label.config(text=text)
@@ -508,10 +586,13 @@ class App(tk.Tk):
 
     def _on_search_done(self, payload):
         self.hub.search_busy = False
+        self._has_more = bool(payload)
         self.more_btn.config(state='normal' if payload else 'disabled')
 
     def _on_qr_image(self, payload):
-        self._show_qr(*payload)
+        win, label, image = payload
+        if win.winfo_exists():   # 用户可能在图片到达前已关掉扫码窗
+            self._show_qr(win, label, image)
 
     def _on_detail_cover(self, payload):
         win, label, image = payload
@@ -526,7 +607,8 @@ class App(tk.Tk):
             label.config(text=text)
 
     def _on_close_qr(self, payload):
-        payload.destroy()
+        if payload.winfo_exists():   # 扫码窗可能已被用户手动关闭
+            payload.destroy()
 
     def _on_error(self, payload):
         messagebox.showerror('错误', payload)
@@ -546,6 +628,7 @@ class App(tk.Tk):
         self.hub.search_keyword = keyword
         self.hub.search_offset = 0
         self.hub.search_busy = True
+        self._has_more = False
         self.more_btn.config(state='disabled')
         self.hub.start(self.hub.search_worker, keyword, 0, False, self.search_tree)
 
@@ -563,9 +646,11 @@ class App(tk.Tk):
         scrollbar.set(first, last)
         if tree is not getattr(self, 'search_tree', None):
             return
+        if self._filters.get(tree):   # 过滤时显示的不是全部结果，禁用自动预加载
+            return
         if self.hub.search_busy or not self.hub.search_keyword:
             return
-        if str(self.more_btn['state']) != 'normal':   # 没有更多结果了
+        if not self._has_more:   # 已到结果末尾（状态由 _on_search_done 维护，免每次读控件）
             return
         total = len(self.tree_songs.get(tree) or ())   # 行数与歌曲数一致，O(1) 取得
         if total == 0:
@@ -584,12 +669,37 @@ class App(tk.Tk):
         nums = re.findall(r'\d+', text)
         return max(nums, key=len) if nums else ''
 
+    def _parse_song_link(self, text: str):
+        """识别单曲链接，返回 (音源, ID/MID)；不是单曲链接则返回 None。
+
+        网易云：/song?id=xxx；QQ：/songDetail/<songmid>。
+        """
+        match = re.search(r'song\?id=(\d+)', text)
+        if match:
+            return 'netease', match.group(1)
+        match = re.search(r'/songDetail/([0-9A-Za-z]+)', text)
+        if match:
+            return 'qq', match.group(1)
+        return None
+
     def do_load_playlist(self):
         text = self.playlist_entry.get().strip()
+        # 单曲链接优先识别：解析出 ID / MID 后作为单曲追加到列表
+        song_link = self._parse_song_link(text)
+        if song_link:
+            source, value = song_link
+            if source != self.cfg.get('source', 'netease'):
+                messagebox.showinfo(
+                    '提示', f'该链接属于 {SOURCE_LABELS.get(source, source)}，'
+                            f'请先在顶部切换到该音源后再添加')
+                return
+            self._append_log(f'添加单曲链接：{value}')
+            self.hub.start(self.hub.song_link_worker, value, self.playlist_tree)
+            return
         # 优先取链接里的 id= 参数，避免误抓到域名中的数字（如 music.163.com 的 163）
         playlist_id = self._parse_playlist_id(text)
         if not playlist_id:
-            messagebox.showinfo('提示', '请输入歌单 ID 或歌单链接')
+            messagebox.showinfo('提示', '请输入歌单 / 单曲链接或歌单 ID')
             return
         self._append_log(f'加载歌单：{playlist_id}')
         self.hub.start(self.hub.playlist_worker, playlist_id, self.playlist_tree)
@@ -603,8 +713,11 @@ class App(tk.Tk):
         return False
 
     def _load_liked_keys(self):
-        """后台拉取「我喜欢的音乐」标识集合，用于列表「喜欢」列。"""
-        if self.logged_in:
+        """后台拉取「我喜欢的音乐」标识集合，用于列表「喜欢」列。
+
+        当前音源已加载过则跳过，避免每次账号校验都重复请求。
+        """
+        if self.logged_in and self._liked_loaded_source != self.cfg.get('source', 'netease'):
             self.hub.start(self.hub.liked_keys_worker)
 
     def _apply_liked_keys(self, payload):
@@ -613,6 +726,7 @@ class App(tk.Tk):
             self._append_log(f'获取「喜欢」状态失败：{data}')
             return
         self.liked_keys = data
+        self._liked_loaded_source = self.cfg.get('source', 'netease')
         self._refresh_likes(self.search_tree)
         self._refresh_likes(self.playlist_tree)
         self._append_log(f'已同步「我喜欢的音乐」：{len(data)} 首')
@@ -706,19 +820,33 @@ class App(tk.Tk):
         return songs[index] if 0 <= index < len(songs) else None
 
     def _fill_tree(self, tree, songs):
-        """整表重载（清空后重建），并重置勾选计数与「序号」列排序基准。"""
-        tree.delete(*tree.get_children())
-        self.tree_songs[tree] = []
-        self._pick_count[tree] = 0
-        self._orig_index.pop(tree, None)
+        """整表重载：按歌曲标识去重后重置勾选 / 排序 / 过滤状态并重建。"""
+        seen = set()
+        unique = []
+        for song in songs:
+            key = song_key(song)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(song)
+        self._all_songs[tree] = unique
+        self._picked_keys[tree] = set()
+        self._tree_seen[tree] = seen
         self._sort_state.pop(tree, None)   # 重新载入后清除排序标记
-        self._append_tree(tree, songs)
+        self._filters[tree] = ''
+        var = self._filter_vars.get(tree)
+        if var is not None and var.get():
+            var.set('')   # 清空过滤框（随后的 _render_tree 会立刻按新数据重建）
+        self._render_tree(tree)
 
     def _append_tree(self, tree, songs):
-        """追加歌曲；自动跳过已存在的重复项（去重）。"""
-        level = self.cfg.get('level', 'exhigh')
-        existing = self.tree_songs.get(tree, [])
-        seen = {song_key(song) for song in existing}
+        """追加歌曲到「全部歌曲」；过滤 / 排序下整表重建，否则增量插入（保留滚动位置）。"""
+        all_songs = self._all_songs.setdefault(tree, [])
+        # 去重集合按树持久化，追加时无需重建整表集合（大列表下省 O(n)）
+        seen = self._tree_seen.get(tree)
+        if seen is None:
+            seen = {song_key(song) for song in all_songs}
+            self._tree_seen[tree] = seen
         added = []
         for song in songs:
             key = song_key(song)
@@ -726,26 +854,85 @@ class App(tk.Tk):
                 continue
             seen.add(key)
             added.append(song)
-        origin = self._orig_index.setdefault(tree, {})
-        for offset, song in enumerate(added):
-            index = len(existing) + offset + 1
-            key = song_key(song)
-            origin.setdefault(key, index)   # 记录原始载入序号，供「序号」列排序
-            mark = 'VIP' if song.fee in (1, 4) else ''
-            tree.insert('', 'end', iid=str(index),
-                        values=(UNPICK_MARK, index, song.name, song.artists,
-                                song.album, song.duration_str,
-                                song.size_hint(level), mark,
-                                '♥' if key in self.liked_keys else ''))
-        self.tree_songs[tree] = existing + added   # 新追加的行都未勾选，计数不变
-        self._update_pick_label(tree)
         skipped = len(songs) - len(added)
+        if not added:
+            if skipped:
+                self._append_log(f'  已跳过 {skipped} 首重复歌曲')
+            return
+        all_songs.extend(added)
+        column, state = self._sort_state.get(tree, (None, 0))
+        if self._filters.get(tree) or state:
+            self._render_tree(tree)   # 已有过滤 / 排序：整表重建以保持顺序一致
+        else:
+            level = self.cfg.get('level', 'exhigh')
+            existing = self.tree_songs.get(tree) or []
+            picked = self._picked_keys.get(tree, set())
+            for offset, song in enumerate(added):
+                index = len(existing) + offset + 1
+                key = song_key(song)
+                tree.insert('', 'end', iid=str(index), values=(
+                    PICK_MARK if key in picked else UNPICK_MARK,
+                    index, song.name, song.artists, song.album, song.duration_str,
+                    song.size_hint(level), 'VIP' if song.fee in (1, 4) else '',
+                    '♥' if key in self.liked_keys else ''))
+            self.tree_songs[tree] = existing + added   # 新追加的行都未勾选，计数不变
+            self._update_pick_label(tree)
+            self._update_stats(tree)
         if skipped:
             self._append_log(f'  已跳过 {skipped} 首重复歌曲')
 
+    def _render_tree(self, tree):
+        """按「全部歌曲 + 排序 + 过滤」重建列表：勾选 / 喜欢状态由集合派生，不依赖行号。
+
+        排序与过滤都只影响显示：基础顺序始终取 _all_songs（载入顺序），
+        因此「还原原始载入顺序」与「清空过滤」都能可靠回到初始视图。
+        """
+        all_songs = self._all_songs.get(tree, [])
+        level = self.cfg.get('level', 'exhigh')
+        column, state = self._sort_state.get(tree, (None, 0))
+        if not state:
+            ordered = list(all_songs)
+        elif column == 'idx':   # 序号即 all_songs 中的载入位置
+            position = {song_key(song): index for index, song in enumerate(all_songs)}
+            ordered = sorted(all_songs, key=lambda s: position.get(song_key(s), 0),
+                             reverse=(state == 2))
+        else:
+            ordered = sorted(all_songs, key=lambda s: self._sort_key(s, column, level),
+                             reverse=(state == 2))
+        keyword = self._filters.get(tree, '')
+        visible = ordered if not keyword else [s for s in ordered if keyword in song_haystack(s)]
+        picked = self._picked_keys.setdefault(tree, set())
+        tree.delete(*tree.get_children())
+        for index, song in enumerate(visible, 1):
+            key = song_key(song)
+            tree.insert('', 'end', iid=str(index), values=(
+                PICK_MARK if key in picked else UNPICK_MARK,
+                index, song.name, song.artists, song.album, song.duration_str,
+                song.size_hint(level), 'VIP' if song.fee in (1, 4) else '',
+                '♥' if key in self.liked_keys else ''))
+        self.tree_songs[tree] = visible
+        self._size_level[tree] = level   # 大小列已按当前音质写好
+        self._update_pick_label(tree)
+        self._update_stats(tree)
+        self._update_headers(tree)
+
+    def _update_stats(self, tree):
+        """刷新统计标签：当前显示首数 · 总时长 · 总大小≈。"""
+        label = self.stats_labels.get(tree)
+        if label is None:
+            return
+        level = self.cfg.get('level', 'exhigh')
+        songs = self.tree_songs.get(tree) or []
+        seconds = sum((song.duration or 0) for song in songs) // 1000
+        size = sum(song.size_value(level) for song in songs)
+        hours, minutes = divmod(seconds // 60, 60)
+        duration = (f'{hours}:{minutes:02d}:{seconds % 60:02d}' if hours
+                    else f'{minutes}:{seconds % 60:02d}')
+        label.config(text=f'{len(songs)} 首 · 总时长 {duration} · 总大小≈ {human_size(size)}')
+
     def _dedupe_tree(self, tree):
         """按歌曲标识去重并重建列表。"""
-        songs = self.tree_songs.get(tree, [])
+        songs = self._all_songs.get(tree, [])
         if not songs:
             return
         seen = set()
@@ -759,70 +946,54 @@ class App(tk.Tk):
         if len(unique) == len(songs):
             self._append_log('未发现重复歌曲')
             return
-        self._fill_tree(tree, unique)
+        self._all_songs[tree] = unique
+        self._tree_seen[tree] = seen
+        self._render_tree(tree)
         self._append_log(f'去重完成：{len(songs)} → {len(unique)} 首')
 
     # ---------------- 排序 ----------------
+    def _sort_key(self, song, column, level):
+        if column == 'name':
+            return song.name.lower()
+        if column == 'artist':
+            return song.artists.lower()
+        if column == 'album':
+            return song.album.lower()
+        if column == 'dur':
+            return song.duration
+        if column == 'size':
+            return song.size_value(level)
+        if column == 'mark':
+            return song.fee
+        if column == 'like':
+            return 1 if song_key(song) in self.liked_keys else 0
+        return 0
+
     def _sort_tree(self, tree, column):
-        """点击表头排序：首次升序，再点切换倒序。
-
-        按歌曲（而非行位置）排序后整表重建：保留每行原有的勾选 / 喜欢等列值，
-        只需 n 次 item 读 + n 次 insert，比「逐行 move + 逐行改写序号」少约三分之一 Tk 调用。
-        """
-        songs = self.tree_songs.get(tree) or []
-        if not songs:
+        """点击表头排序：升序 → 降序 → 还原原始载入顺序，三态循环。"""
+        if not self._all_songs.get(tree):
             return
-        prev_column, prev_reverse = self._sort_state.get(tree, (None, False))
-        reverse = not prev_reverse if prev_column == column else False
-        level = self.cfg.get('level', 'exhigh')
-        origin = self._orig_index.get(tree, {})
-
-        def sort_key(song):
-            if column == 'idx':
-                return origin.get(song_key(song), 0)   # 按原始载入顺序
-            if column == 'name':
-                return song.name.lower()
-            if column == 'artist':
-                return song.artists.lower()
-            if column == 'album':
-                return song.album.lower()
-            if column == 'dur':
-                return song.duration
-            if column == 'size':
-                return song.size_value(level)
-            if column == 'mark':
-                return song.fee
-            if column == 'like':
-                return 1 if song_key(song) in self.liked_keys else 0
-            return 0
-
-        ordered = sorted(songs, key=sort_key, reverse=reverse)
-        # 先按歌曲标识取出各行的完整列值（含勾选 / 喜欢），重建时原样写回
-        rows = {}
-        for iid in tree.get_children():
-            song = self._song_at(tree, iid)
-            if song is not None:
-                rows[song_key(song)] = tree.item(iid, 'values')
-        tree.delete(*tree.get_children())
-        for index, song in enumerate(ordered, 1):
-            values = list(rows.get(song_key(song)) or ())
-            if len(values) < len(COLUMNS):   # 兜底：行值缺失时按当前配置补全
-                values = [UNPICK_MARK, index, song.name, song.artists, song.album,
-                          song.duration_str, song.size_hint(level),
-                          'VIP' if song.fee in (1, 4) else '',
-                          '♥' if song_key(song) in self.liked_keys else '']
-            values[COL['idx']] = index
-            tree.insert('', 'end', iid=str(index), values=values)
-        self.tree_songs[tree] = ordered
-        self._sort_state[tree] = (column, reverse)
-        self._update_headers(tree)
+        prev_column, prev_state = self._sort_state.get(tree, (None, 0))
+        if prev_column != column:
+            state = 1                 # 首次点击该列 → 升序
+        elif prev_state == 1:
+            state = 2                 # 升序 → 降序
+        else:
+            state = 0                 # 降序 → 还原原始载入顺序
+        self._sort_state[tree] = (column if state else None, state)
+        self._render_tree(tree)
 
     def _update_headers(self, tree):
-        column, reverse = self._sort_state.get(tree, (None, False))
+        column, state = self._sort_state.get(tree, (None, 0))
         for col, label in HEAD_LABELS.items():
             if col == 'pick':
                 continue
-            text = label + (' ▼' if reverse else ' ▲') if col == column else label
+            if col == column and state == 1:
+                text = label + ' ▲'
+            elif col == column and state == 2:
+                text = label + ' ▼'
+            else:
+                text = label
             tree.heading(col, text=text)
 
     def _toggle_pick(self, tree, event=None):
@@ -838,25 +1009,38 @@ class App(tk.Tk):
         self._set_pick(tree, iid, mark)
 
     def _set_pick(self, tree, iid, mark):
-        """写入单行勾选状态，并增量维护已选计数（避免全表统计）。"""
-        if tree.set(iid, 'pick') == mark:
+        """切换单行勾选，并按歌曲标识维护勾选集合（重建行号也不会丢失）。"""
+        song = self._song_at(tree, iid)
+        if song is None:
             return
         tree.set(iid, 'pick', mark)
-        self._pick_count[tree] = self._pick_count.get(tree, 0) + (1 if mark == PICK_MARK else -1)
+        picked = self._picked_keys.setdefault(tree, set())
+        if mark == PICK_MARK:
+            picked.add(song_key(song))
+        else:
+            picked.discard(song_key(song))
         self._update_pick_label(tree)
 
     def _set_all_pick(self, tree, picked):
+        """全选 / 清空勾选：以「当前显示的行」为范围。"""
         mark = PICK_MARK if picked else UNPICK_MARK
         for iid in tree.get_children():
             tree.set(iid, 'pick', mark)
-        self._pick_count[tree] = len(tree.get_children()) if picked else 0
+        if picked:
+            self._picked_keys[tree] = {song_key(song)
+                                       for song in self.tree_songs.get(tree, [])}
+        else:
+            self._picked_keys[tree] = set()
         self._update_pick_label(tree)
 
     def _picked_songs(self, tree):
-        """返回勾选的歌曲；没勾选时回退到高亮选中的行。"""
-        result = [song for iid in tree.get_children()
-                  if (song := self._song_at(tree, iid)) is not None
-                  and tree.set(iid, 'pick') == PICK_MARK]
+        """返回勾选的歌曲（按载入顺序）；没勾选时回退到高亮选中的行。
+
+        勾选集合按歌曲标识维护，过滤 / 排序后隐藏的歌曲仍会被计入与下载。
+        """
+        picked = self._picked_keys.get(tree, set())
+        result = [song for song in self._all_songs.get(tree, [])
+                  if song_key(song) in picked]
         if result:
             return result
         return [song for iid in tree.selection()
@@ -866,7 +1050,7 @@ class App(tk.Tk):
         label = self.pick_labels.get(tree)
         if label is None:
             return
-        label.config(text=f'已选 {self._pick_count.get(tree, 0)} 首')
+        label.config(text=f'已选 {len(self._picked_keys.get(tree, ()))} 首')
 
     def _active_tree(self):
         index = self.nb.index(self.nb.select())
@@ -987,7 +1171,7 @@ class App(tk.Tk):
         """下载选项窗：音质 + 歌词/标签/封面/跳过已存在。确认后记住为下次默认。"""
         win = tk.Toplevel(self)
         win.title('下载选项')
-        win.geometry('400x360')
+        win.geometry('400x390')
         win.transient(self)
         win.grab_set()
 
@@ -1009,12 +1193,14 @@ class App(tk.Tk):
         lyric_var = tk.BooleanVar(value=self.cfg.get('save_lyric', True))
         tag_var = tk.BooleanVar(value=self.cfg.get('embed_tag', True))
         cover_var = tk.BooleanVar(value=self.cfg.get('embed_cover', True))
+        embed_lyric_var = tk.BooleanVar(value=self.cfg.get('embed_lyric', True))
         skip_var = tk.BooleanVar(value=self.cfg.get('skip_existing', True))
         opts = ttk.Frame(win, padding=12)
         opts.pack(fill='x')
         ttk.Checkbutton(opts, text='下载歌词 (.lrc)', variable=lyric_var).pack(anchor='w')
         ttk.Checkbutton(opts, text='嵌入标签（歌名 / 歌手 / 专辑）', variable=tag_var).pack(anchor='w')
         ttk.Checkbutton(opts, text='嵌入封面', variable=cover_var).pack(anchor='w')
+        ttk.Checkbutton(opts, text='嵌入歌词到标签', variable=embed_lyric_var).pack(anchor='w')
         ttk.Checkbutton(opts, text='跳过已存在的文件', variable=skip_var).pack(anchor='w')
         ttk.Label(win, text=f'共 {len(songs)} 首（切换音质会同步刷新列表「大小≈」）',
                   padding=(12, 0)).pack(anchor='w')
@@ -1026,18 +1212,32 @@ class App(tk.Tk):
 
         level_box.bind('<<ComboboxSelected>>', preview)
 
+        def restore_sizes():
+            # 预览只是临时展示；关闭窗口时按当前配置音质回填，避免与 cfg 不一致
+            for tree in (self.search_tree, self.playlist_tree):
+                self._size_level.pop(tree, None)
+                self._refresh_sizes(tree)
+
+        def on_close():
+            restore_sizes()
+            win.destroy()
+
+        win.protocol('WM_DELETE_WINDOW', on_close)   # 取消 / 直接关闭时回滚预览
+
         def confirm():
             level = label_levels.get(level_var.get(), current)
             options = {
                 'save_lyric': bool(lyric_var.get()),
                 'embed_tag': bool(tag_var.get()),
                 'embed_cover': bool(cover_var.get()),
+                'embed_lyric': bool(embed_lyric_var.get()),
             }
             # 记住本次选择，作为下次默认（避免设置页再维护一份重复选项）
             self.cfg['level'] = level
             self.cfg['save_lyric'] = options['save_lyric']
             self.cfg['embed_tag'] = options['embed_tag']
             self.cfg['embed_cover'] = options['embed_cover']
+            self.cfg['embed_lyric'] = options['embed_lyric']
             self.cfg['skip_existing'] = bool(skip_var.get())
             save_config(self.cfg)
             self._refresh_sizes(self.search_tree)
@@ -1072,6 +1272,43 @@ class App(tk.Tk):
             self._cleanup_after_cancel(payload['downloader'])
         elif success and self.cfg.get('open_dir_after_download'):
             self._open_download_dir()   # 设置项开启时，下载成功后自动打开下载目录
+        if not payload['cancelled'] and self.cfg.get('notify_on_finish'):
+            self._notify('下载完成', summary)
+
+    def _notify(self, title, message):
+        """下载完成的轻量提醒：提示音 + 右下角浮窗 + 任务栏闪烁（全部尽力而为）。"""
+        try:
+            import winsound
+            winsound.MessageBeep()
+        except Exception:  # noqa: BLE001 - 无声环境忽略
+            pass
+        try:
+            self._flash_taskbar()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            win = tk.Toplevel(self)
+            win.title(title)
+            win.overrideredirect(True)
+            win.attributes('-topmost', True)
+            frame = ttk.Frame(win, padding=14, relief='solid', borderwidth=1)
+            frame.pack()
+            ttk.Label(frame, text=title, font=('', 10, 'bold')).pack(anchor='w')
+            ttk.Label(frame, text=message, wraplength=280, justify='left').pack(anchor='w', pady=(4, 0))
+            win.update_idletasks()
+            width, height = win.winfo_width(), win.winfo_height()
+            x = win.winfo_screenwidth() - width - 24
+            y = win.winfo_screenheight() - height - 64
+            win.geometry(f'+{x}+{y}')
+            win.after(6000, win.destroy)
+        except Exception:  # noqa: BLE001 - 浮窗失败不影响主流程
+            pass
+
+    def _flash_taskbar(self):
+        """通过 ctypes 让窗口在任务栏闪烁（Windows 专用，失败静默）。"""
+        import ctypes
+        hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+        ctypes.windll.user32.FlashWindow(hwnd, True)
 
     def _cleanup_after_cancel(self, downloader):
         """取消后按设置处理本次产生的文件（未完成的 .part 与已下载的音频/歌词）。"""
@@ -1124,12 +1361,14 @@ class App(tk.Tk):
         self.cfg['cookie'] = cookie
         save_config(self.cfg)
         self.api.set_cookie(cookie)
+        self._liked_loaded_source = None   # 重新登录后需刷新「喜欢」集合
         self._append_log('网易云登录成功，Cookie 已写入 config.json')
         self.hub.start(self.hub.check_account)
 
     def _on_qq_login(self, _payload=None):
         self.cfg['qq_credential'] = self.api.credential_dict()
         save_config(self.cfg)
+        self._liked_loaded_source = None   # 重新登录后需刷新「喜欢」集合
         self._append_log('QQ 音乐登录成功，凭证已写入 config.json')
         self.hub.start(self.hub.check_account)
 
@@ -1145,6 +1384,7 @@ class App(tk.Tk):
         self.logged_sources[source] = None
         self.logged_in = False
         self.liked_keys = set()
+        self._liked_loaded_source = None
         self._refresh_likes(self.search_tree)
         self._refresh_likes(self.playlist_tree)
         self._sync_login_buttons()
@@ -1278,9 +1518,12 @@ class App(tk.Tk):
         self.cfg['name_template'] = self.tpl_var.get().strip() or '{artist} - {name}'
         self.cfg['retry'] = int(self.retry_var.get())
         self.cfg['workers'] = max(1, min(8, int(self.workers_var.get())))
+        self.cfg['folder_structure'] = LABEL_FOLDER_STRUCTURE.get(
+            self.folder_var.get(), 'none')
         self.cfg['cancel_cleanup'] = LABEL_CANCEL_CLEANUP.get(
             self.cancel_cleanup_var.get(), 'ask')
         self.cfg['open_dir_after_download'] = bool(self.open_dir_var.get())
+        self.cfg['notify_on_finish'] = bool(self.notify_var.get())
         save_config(self.cfg)
         self._append_log('设置已保存')
 
@@ -1414,3 +1657,4 @@ class App(tk.Tk):
             if song is None:
                 continue
             tree.set(iid, 'size', song.size_hint(level))   # 单格写入，免读改写
+        self._update_stats(tree)   # 音质变了，统计里的总大小也要跟着更新
