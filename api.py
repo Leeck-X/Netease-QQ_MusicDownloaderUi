@@ -6,14 +6,14 @@
       搜索、账号校验、二维码登录、匿名注册
 """
 import base64
+import concurrent.futures
 import hashlib
 import json
 import random
-import time
 
 import requests
 
-from encrypt import encrypt
+from encrypt import WEApiCipher, WEApiKeys
 from models import Song
 
 BASE = 'https://music.163.com'
@@ -22,6 +22,9 @@ UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
 
 # 匿名注册里用于混淆设备号的固定异或密钥
 ID_XOR_KEY_1 = '3go8&$8*3*3h0k(2)2'
+
+DETAIL_BATCH = 500        # 歌曲详情接口每批最多 id 数
+DETAIL_MAX_WORKERS = 3    # 长歌单分批并发上限（过低无收益，过高易触发风控）
 
 
 def parse_cookie(cookie_str: str) -> dict:
@@ -50,14 +53,20 @@ def _generate_device_id() -> str:
 class NetEaseAPI:
     source = 'netease'
 
-    def __init__(self, cookie: str = ''):
+    def __init__(self, cookie: str = '', weapi_keys=None):
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': UA,
             'Referer': BASE + '/',
             'Origin': BASE,
         })
+        # weapi 加密密钥：来自 config.json 的 weapi_keys，缺失时回退内置默认值
+        self._cipher = WEApiCipher(WEApiKeys.from_config(weapi_keys))
         self.set_cookie(cookie)
+
+    def set_weapi_keys(self, weapi_keys) -> None:
+        """替换 weapi 加密密钥；已登录的 cookie / 匿名 token 不受影响。"""
+        self._cipher = WEApiCipher(WEApiKeys.from_config(weapi_keys))
 
     # ---------------- Cookie ----------------
     def set_cookie(self, cookie_str: str) -> None:
@@ -84,7 +93,8 @@ class NetEaseAPI:
     def _weapi(self, path: str, payload: dict) -> dict:
         """weapi 签名请求（加密 body）。"""
         params = {'csrf_token': self._csrf_token()}
-        resp = self.session.post(BASE + path, data=encrypt(payload), params=params, timeout=20)
+        resp = self.session.post(BASE + path, data=self._cipher.encrypt(payload),
+                                 params=params, timeout=20)
         resp.raise_for_status()
         return resp.json()
 
@@ -115,17 +125,62 @@ class NetEaseAPI:
         return detail or [Song.from_raw(item) for item in songs]
 
     def song_detail(self, ids) -> list:
+        """批量取歌曲详情（每 DETAIL_BATCH 首一批）。
+
+        单批直接走主会话；多批时并发请求（各批独立会话），缩短长歌单加载时间；
+        并发任一批失败则回退为串行，保证与旧行为一致。
+        """
         ids = list(ids)
+        if not ids:
+            return []
+        chunks = [ids[start:start + DETAIL_BATCH]
+                  for start in range(0, len(ids), DETAIL_BATCH)]
+        if len(chunks) == 1:
+            raws = [self._detail_chunk(chunks[0], self.session)]
+        else:
+            raws = self._detail_chunks_concurrent(chunks)
+            if raws is None:   # 并发失败，串行重试
+                raws = [self._detail_chunk(chunk, self.session) for chunk in chunks]
         songs = []
-        for start in range(0, len(ids), 500):
-            chunk = ids[start:start + 500]
-            res = self._weapi('/weapi/v3/song/detail', {
+        for raw in raws:
+            songs.extend(raw or [])
+        return [Song.from_raw(item) for item in songs]
+
+    def _detail_chunk(self, chunk, session) -> list:
+        """取一批歌曲详情的原始结构（该接口只接受 weapi 加密体）。"""
+        res = session.post(
+            BASE + '/weapi/v3/song/detail',
+            data=self._cipher.encrypt({
                 'c': json.dumps([{'id': i} for i in chunk]),
                 'ids': json.dumps(chunk),
-            })
-            songs.extend(res.get('songs') or [])
-            time.sleep(0.3)
-        return [Song.from_raw(item) for item in songs]
+            }),
+            params={'csrf_token': self._csrf_token()},
+            timeout=20,
+        )
+        res.raise_for_status()
+        return res.json().get('songs') or []
+
+    def _detail_chunks_concurrent(self, chunks) -> list:
+        """并发取多批详情并按原顺序返回；任一批失败返回 None 交给调用方串行回退。"""
+        try:
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(DETAIL_MAX_WORKERS, len(chunks)),
+                    thread_name_prefix='detail') as pool:
+                jobs = [pool.submit(self._detail_chunk, chunk, self._new_session_like())
+                        for chunk in chunks]
+                return [job.result() for job in jobs]
+        except Exception:  # noqa: BLE001 - 并发失败不影响可用性
+            return None
+
+    def _new_session_like(self):
+        """为并发批请求复制一个会话（共享请求头与 cookie，避免并发共享 Session）。"""
+        session = requests.Session()
+        session.headers.update(self.session.headers)
+        for cookie in self.session.cookies:
+            session.cookies.set(cookie.name, cookie.value,
+                                domain=cookie.domain or 'music.163.com',
+                                path=cookie.path or '/')
+        return session
 
     def playlist_detail(self, playlist_id) -> dict:
         res = self._weapi('/weapi/v6/playlist/detail', {

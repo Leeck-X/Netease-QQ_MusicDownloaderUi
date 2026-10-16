@@ -30,6 +30,7 @@
 - 下载选项弹窗确认后会记忆为下次默认
 - 下载中可**暂停 / 继续 / 取消**，断点续传（HTTP Range），暂停后继续不会重新下载
 - 取消下载后可选「每次询问 / 总是删除 / 总是保留」本次产生的文件
+- 可选「下载完成后自动打开下载目录」（设置页开启）
 
 **登录**
 - Cookie 登录、扫码登录（网易云与 QQ 均支持）
@@ -38,6 +39,7 @@
 **界面与交互**
 - 控件随窗口自适应缩放，窗口变窄时优先压缩输入框 / 进度条，按钮不会被挤出
 - 窗口大小与位置自动记忆，下次启动恢复上次关闭时的状态
+- 设置页「高级密钥」可在程序内查看 / 修改 / 保存 weapi 加密密钥（即时生效），并查看留档的 API 凭证
 - 快捷键：`Ctrl+F` 定位搜索框、`Ctrl+L` 定位歌单框、`Ctrl+1/2/3` 切换标签页
 
 ## 环境要求
@@ -56,7 +58,12 @@ python main.py
 
 程序读取同目录下的 `config.json`（配置读写逻辑位于 `ui.py`）。网易云 API 凭证（app_id / app_secret / RSA 密钥对）也保存在 `config.json` 中，**源码内不含任何密钥**。
 
-发布包中的 `config.json` 已带好内置凭证，开箱即用；若该文件缺失，程序会以代码内的默认值启动（凭证为空，需自行补全后才能使用网易云接口）。
+`config.json` 中的两类密钥：
+
+- **`weapi_keys`**：weapi 加密接口（歌曲详情、歌单、取址、歌词）真正使用的加密密钥，默认值与网易云 web 客户端一致。可在**设置页 →「高级密钥」→ weapi 加密密钥**中查看 / 修改 / 校验 / 恢复默认，保存后立即生效（不会重建登录态与匿名 token）。
+- **`credentials`**：内置 API 凭证（app_id / app_secret / RSA 密钥对），当前版本**不参与任何请求**，仅为留档与后续扩展保留；其 RSA 密钥为 2048 位，与 weapi 所需的 1024 位模数不兼容，**不能**当作 `weapi_keys` 使用。可在「高级密钥」→ API 凭证页查看。
+
+发布包中的 `config.json` 已带好内置凭证与默认 `weapi_keys`，开箱即用；若该文件缺失，程序会以代码内的默认值启动。
 
 **`config.json` 会保存你的登录 Cookie 与凭证，请勿提交到公开仓库。**
 
@@ -77,12 +84,13 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed --name MusicDownl
 ```
 .
 ├── main.py            # 程序入口
-├── ui.py              # Tkinter 界面 + 配置读写
+├── ui.py              # Tkinter 界面 + 配置读写 + 事件分派
+├── services.py        # 后台服务层（ServiceHub：线程调度、消息投递、各 worker）
 ├── providers.py       # 音源工厂（网易云 / QQ）
 ├── api.py             # 网易云 Provider
 ├── qq_api.py          # QQ 音乐 Provider
 ├── downloader.py      # 下载器（进度 / 重试 / 暂停取消 / 标签歌词）
-├── encrypt.py         # 网易云 weapi 加密
+├── encrypt.py         # 网易云 weapi 加密（密钥可通过设置页配置）
 ├── models.py          # 数据模型（Song 等）
 ├── config.json        # 配置与内置凭证（不入库，随发布包分发）
 └── requirements.txt   # 依赖清单

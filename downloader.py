@@ -313,23 +313,29 @@ class ProgressHub:
         self._emit = emit
         self._slots = {}                    # 序号 -> 完成度
         self._bytes = {}                    # 序号 -> 累计字节
+        self._sum_bytes = 0                 # sum(self._bytes.values())，增量维护，避免每次遍历
+        self._sum_slots = 0.0               # sum(self._slots.values())，同上
         self._samples = deque()             # (时间戳, 累计字节)
         self._last_emit = 0.0
 
     def update(self, index: int, ratio: float, done: int) -> None:
         now = time.time()
         with self._lock:
-            if done > self._bytes.get(index, 0):
+            prev_bytes = self._bytes.get(index, 0)
+            if done > prev_bytes:
                 self._bytes[index] = done
-            if ratio > self._slots.get(index, 0.0):
+                self._sum_bytes += done - prev_bytes
+            prev_ratio = self._slots.get(index, 0.0)
+            if ratio > prev_ratio:
                 self._slots[index] = ratio
-            self._samples.append((now, sum(self._bytes.values())))
+                self._sum_slots += ratio - prev_ratio
+            self._samples.append((now, self._sum_bytes))
             while self._samples and now - self._samples[0][0] > self.WINDOW:
                 self._samples.popleft()
             if now - self._last_emit < self.EMIT_INTERVAL:
                 return
             self._last_emit = now
-            overall = min(sum(self._slots.values()) / self._total, 1.0)
+            overall = min(self._sum_slots / self._total, 1.0)
             speed = self._speed_locked(now)
         self._emit(overall, speed)
 
@@ -337,14 +343,15 @@ class ProgressHub:
         """某首歌结束（成功 / 跳过 / 失败），该格记满。"""
         now = time.time()
         with self._lock:
+            self._sum_slots += 1.0 - self._slots.get(index, 0.0)
             self._slots[index] = 1.0
-            overall = min(sum(self._slots.values()) / self._total, 1.0)
+            overall = min(self._sum_slots / self._total, 1.0)
             speed = self._speed_locked(now)
         self._emit(overall, speed)
 
     def final(self) -> None:
         with self._lock:
-            overall = min(sum(self._slots.values()) / self._total, 1.0)
+            overall = min(self._sum_slots / self._total, 1.0)
         self._emit(overall, 0.0)
 
     def _speed_locked(self, now: float) -> float:
@@ -352,5 +359,5 @@ class ProgressHub:
         for t, b in self._samples:
             dt = now - t
             if dt >= 0.5:
-                return max((sum(self._bytes.values()) - b) / dt, 0.0)
+                return max((self._sum_bytes - b) / dt, 0.0)
         return 0.0

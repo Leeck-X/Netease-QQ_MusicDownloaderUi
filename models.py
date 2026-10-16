@@ -24,14 +24,6 @@ LEVELS_QQ = [
     ('hires', 'Hi-Res 母带'),
 ]
 LEVELS_BY_SOURCE = {'netease': LEVELS_NETEASE, 'qq': LEVELS_QQ}
-# 兼容旧引用：默认按网易云
-LEVELS = LEVELS_NETEASE
-LEVEL_LABELS = dict(LEVELS_NETEASE)
-LABEL_LEVELS = {label: level for level, label in LEVELS_NETEASE}
-LABEL_LEVELS_BY_SOURCE = {
-    source: {label: level for level, label in levels}
-    for source, levels in LEVELS_BY_SOURCE.items()
-}
 
 # 仅「标准」档可选编码；无损/Hi-Res 由服务端固定返回 flac
 ENCODE_TYPES = [('mp3', 'MP3'), ('aac', 'AAC / M4A')]

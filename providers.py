@@ -25,6 +25,19 @@ def get_provider(source: str, cfg: dict):
     if source == 'qq':
         api = QQMusicAPI(cfg.get('qq_credential') or {})
     else:
-        api = NetEaseAPI(cfg.get('cookie', ''))
+        api = NetEaseAPI(cfg.get('cookie', ''), cfg.get('weapi_keys'))
     _CACHE[source] = api
+    return api
+
+
+def apply_weapi_keys(cfg: dict):
+    """把配置里的 weapi 密钥应用到已缓存的网易云实例。
+
+    只修改实例、绝不重建 _CACHE——重建会丢掉匿名 token 与登录态。
+    实例尚未创建时返回 None，下次 get_provider 会用新密钥直接构造。
+    """
+    api = _CACHE.get('netease')
+    if api is None:
+        return None
+    api.set_weapi_keys(cfg.get('weapi_keys'))
     return api

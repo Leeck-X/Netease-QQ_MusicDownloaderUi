@@ -1,24 +1,24 @@
 """Tkinter 图形界面：登录栏 + 搜索页 + 歌单页 + 设置页 + 进度与日志。"""
-import concurrent.futures
-import io
 import json
 import os
 import queue
 import re
 import sys
-import threading
-import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
-import qrcode
-import requests
-from PIL import Image, ImageTk
+from PIL import ImageTk
 
-from downloader import Control, DownloadCancelled, Downloader, ProgressHub, fmt_speed
+from downloader import Control, fmt_speed
+from encrypt import WEApiKeys
 from models import (ENCODE_LABELS, ENCODE_TYPES, LABEL_ENCODES,
                     LEVELS_BY_SOURCE, human_size)
-from providers import SOURCE_LABELS, SOURCES, get_provider
+from providers import SOURCE_LABELS, SOURCES, apply_weapi_keys, get_provider
+from services import (ServiceHub, TAG_ACCOUNT, TAG_APPEND_SONGS, TAG_CLOSE_QR,
+                      TAG_DETAIL_COVER, TAG_DOWNLOAD_END, TAG_ERROR,
+                      TAG_LIKED_KEYS, TAG_LOG, TAG_LOGIN_OK, TAG_MY_PLAYLISTS,
+                      TAG_PROGRESS, TAG_PROBE_DONE, TAG_QQ_LOGIN_OK,
+                      TAG_QR_IMAGE, TAG_SEARCH_DONE, TAG_SONGS, TAG_STATUS)
 
 # ---------------- 配置读写 ----------------
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -33,7 +33,8 @@ DEFAULT_CONFIG = {
     'source': 'netease',          # 当前音源：netease | qq
     'cookie': '',                 # 网易云 cookie
     'qq_credential': {},          # QQ 音乐登录凭证（Credential.model_dump）
-    'credentials': {},            # 网易云 API 凭证（随 exe 分发的 config.json 提供）
+    'credentials': {},            # 网易云 API 凭证（当前不参与任何请求，仅为留档）
+    'weapi_keys': WEApiKeys().to_dict(),   # weapi 加密密钥（真正生效，可在设置页修改）
     'download_dir': os.path.join(APP_DIR, 'downloads'),
     'level': 'exhigh',
     'encode_type': 'mp3',
@@ -46,6 +47,7 @@ DEFAULT_CONFIG = {
     'retry': 3,
     'workers': 3,                 # 并发下载线程数（1~8）
     'cancel_cleanup': 'ask',      # 取消下载后：ask 每次询问 | delete 总是删除 | keep 总是保留
+    'open_dir_after_download': False,   # 下载成功后自动打开下载目录
     'use_anonimous': True,
 }
 
@@ -76,7 +78,11 @@ HEAD_LABELS = {'pick': '选', 'idx': '序号', 'name': '歌名', 'artist': '歌�
 COL_WIDTHS = {'pick': 40, 'idx': 50, 'name': 250, 'artist': 160,
               'album': 190, 'dur': 60, 'size': 80, 'mark': 50, 'like': 50}
 
-PAGE_SIZE = 50       # 每次搜索 / 加载更多请求的条数
+# 树控件列顺序，以及列名 -> 列索引（Treeview values 元组按此顺序取值）
+COLUMNS = ('pick', 'idx', 'name', 'artist', 'album', 'dur', 'size', 'mark', 'like')
+COL = {name: index for index, name in enumerate(COLUMNS)}
+PICK_MARK, UNPICK_MARK = '☑', '☐'
+
 PRELOAD_ROWS = 50    # 视口下方剩余不足该行数时，自动预加载下一页
 
 # 取消下载后的文件处理方式（设置页可选）
@@ -102,19 +108,39 @@ class App(tk.Tk):
         self.api = get_provider(self.cfg['source'], self.cfg)
         self.msg_queue = queue.Queue()
         self.tree_songs = {}          # 树控件 -> 歌曲列表
+        self._orig_index = {}         # 树控件 -> {歌曲标识: 原始载入序号}（供「序号」列排序）
+        self._pick_count = {}         # 树控件 -> 已勾选数量（增量维护，避免每次全表统计）
         self._downloading = False
         self._dl_control = None       # 当前下载的暂停/取消控制
-        self._qr_stop = False
         self.logged_in = False        # 当前音源是否已登录
         self.logged_sources = {}      # 音源 -> 登录 profile（用于下载前校验）
-        self._search_keyword = ''     # 搜索分页：当前关键词
-        self._search_offset = 0       # 搜索分页：下一页偏移
-        self._search_busy = False     # 搜索分页：正在请求中（防止重复触发）
+        # 后台服务层：线程调度与消息投递，worker 实现见 services.py
+        self.hub = ServiceHub(self.msg_queue, lambda: self.cfg, lambda: self.api)
         self.pick_labels = {}         # 树控件 -> 已选计数标签
         self._sort_state = {}         # 树控件 -> (排序列, 是否倒序)
         self._size_level = {}         # 树控件 -> 上次刷新「大小」列所用音质
         self._liked_snapshot = {}     # 树控件 -> 上次刷新「喜欢」列所用集合
         self.liked_keys = set()       # 「我喜欢的音乐」标识集合（当前音源）
+        # 消息 tag -> 处理函数（主线程分派，见 _handle）
+        self._handlers = {
+            TAG_LOG: self._append_log,
+            TAG_STATUS: self._set_status,
+            TAG_PROGRESS: self._on_progress,
+            TAG_SONGS: self._on_songs,
+            TAG_APPEND_SONGS: self._on_append_songs,
+            TAG_SEARCH_DONE: self._on_search_done,
+            TAG_MY_PLAYLISTS: self._show_my_playlists,
+            TAG_LIKED_KEYS: self._apply_liked_keys,
+            TAG_DOWNLOAD_END: self._finish_download,
+            TAG_LOGIN_OK: self._apply_login,
+            TAG_QQ_LOGIN_OK: self._on_qq_login,
+            TAG_QR_IMAGE: self._on_qr_image,
+            TAG_DETAIL_COVER: self._on_detail_cover,
+            TAG_PROBE_DONE: self._on_probe_done,
+            TAG_CLOSE_QR: self._on_close_qr,
+            TAG_ACCOUNT: self._show_account,
+            TAG_ERROR: self._on_error,
+        }
 
         self._build_top()
         self._build_tabs()
@@ -122,7 +148,7 @@ class App(tk.Tk):
         self._bind_shortcuts()
 
         self._poll_queue()
-        self.after(400, lambda: self._bg(self._check_account))
+        self.after(400, lambda: self.hub.start(self.hub.check_account))
 
     def _on_close(self):
         """关闭前保存窗口大小 / 位置，下次启动恢复。"""
@@ -215,7 +241,7 @@ class App(tk.Tk):
         self._sync_login_buttons()
         self._sync_levels()
         self._append_log(f'已切换到 {SOURCE_LABELS[source]}')
-        self._bg(self._check_account)
+        self.hub.start(self.hub.check_account)
 
     def _sync_levels(self):
         """切换音源后校正音质档位：当前档位在新音源下非法时回退到「极高 320k」。"""
@@ -234,9 +260,8 @@ class App(tk.Tk):
         self._build_settings_tab()
 
     def _make_song_tree(self, parent):
-        columns = ('pick', 'idx', 'name', 'artist', 'album', 'dur', 'size', 'mark', 'like')
-        tree = ttk.Treeview(parent, columns=columns, show='headings', selectmode='extended')
-        for col in columns:
+        tree = ttk.Treeview(parent, columns=COLUMNS, show='headings', selectmode='extended')
+        for col in COLUMNS:
             tree.heading(col, text=HEAD_LABELS[col])
             tree.column(col, width=COL_WIDTHS[col],
                         anchor='center' if col in ('pick', 'idx', 'dur', 'size', 'mark', 'like')
@@ -312,7 +337,7 @@ class App(tk.Tk):
                    command=lambda: self._dedupe_tree(tree)).pack(side='right', padx=4)
         sel_label = ttk.Label(holder, text='已选 0 首')
         sel_label.pack(side='right', padx=(0, 10))
-        self.pick_labels[str(tree)] = sel_label
+        self.pick_labels[tree] = sel_label
         return holder
 
     def _build_settings_tab(self):
@@ -363,6 +388,17 @@ class App(tk.Tk):
         ttk.Combobox(holder, textvariable=self.cancel_cleanup_var, state='readonly',
                      values=list(CANCEL_CLEANUP_LABELS.values()), width=22).pack(side='left')
         ttk.Label(holder, text='处理本次已下载 / 未完成的文件').pack(side='left', padx=8)
+
+        holder = line('下载完成后')
+        self.open_dir_var = tk.BooleanVar(value=bool(self.cfg.get('open_dir_after_download')))
+        ttk.Checkbutton(holder, text='自动打开下载目录',
+                        variable=self.open_dir_var).pack(side='left')
+
+        holder = line('高级密钥')
+        ttk.Button(holder, text='加密密钥与 API 凭证…',
+                   command=self._open_keys_dialog).pack(side='left')
+        ttk.Label(holder, text='weapi 加密密钥即时生效；API 凭证当前不参与请求',
+                  foreground='#666').pack(side='left', padx=8)
 
         ttk.Label(tab, text='音质、歌词、标签、封面、跳过已存在等选项在下载时于「下载选项」窗口中选择，'
                             '确认后会记住为下次默认。',
@@ -440,67 +476,60 @@ class App(tk.Tk):
         self.log_box.config(state='disabled')
 
     # ---------------- 队列与线程 ----------------
-    def _bg(self, func, *args):
-        threading.Thread(target=func, args=args, daemon=True).start()
-
     def _poll_queue(self):
-        try:
-            while True:
-                kind, payload = self.msg_queue.get_nowait()
-                self._handle(kind, payload)
-        except queue.Empty:
-            pass
+        # 把队列里累积的消息一次性交给主线程处理，避免逐条等待
+        self.hub.drain(self._handle)
         self.after(100, self._poll_queue)
 
     def _handle(self, kind, payload):
-        if kind == 'log':
-            self._append_log(payload)
-        elif kind == 'status':
-            self.status_label.config(text=payload)
-        elif kind == 'progress':
-            ratio, speed = payload
-            self.progress['value'] = ratio * 100
-            text = f'{int(ratio * 100)}%'
-            if speed:
-                text += f' · {fmt_speed(speed)}'
-            self.progress_label.config(text=text)
-        elif kind == 'songs':
-            tree, songs = payload
-            self._fill_tree(tree, songs)
-        elif kind == 'append_songs':
-            tree, songs = payload
-            self._append_tree(tree, songs)
-        elif kind == 'search_done':
-            self._search_busy = False
-            self.more_btn.config(state='normal' if payload else 'disabled')
-        elif kind == 'my_playlists':
-            self._show_my_playlists(payload)
-        elif kind == 'liked_keys':
-            self._apply_liked_keys(payload)
-        elif kind == 'download_end':
-            self._finish_download(payload)
-        elif kind == 'login_ok':
-            self._apply_login(payload)
-        elif kind == 'qq_login_ok':
-            self._on_qq_login()
-        elif kind == 'qr_image':
-            self._show_qr(*payload)
-        elif kind == 'detail_cover':
-            win, label, image = payload
-            if win.winfo_exists():
-                photo = ImageTk.PhotoImage(image)
-                win._photo = photo   # 保持引用，避免被回收
-                label.config(image=photo, text='')
-        elif kind == 'probe_done':
-            win, label, text = payload
-            if win.winfo_exists():
-                label.config(text=text)
-        elif kind == 'close_qr':
-            payload.destroy()
-        elif kind == 'account':
-            self._show_account(payload)
-        elif kind == 'error':
-            messagebox.showerror('错误', payload)
+        """主线程消息分派：查表调用对应处理函数（见 __init__ 的 _handlers）。"""
+        handler = self._handlers.get(kind)
+        if handler is not None:
+            handler(payload)
+
+    def _set_status(self, text):
+        self.status_label.config(text=text)
+
+    def _on_progress(self, payload):
+        ratio, speed = payload
+        self.progress['value'] = ratio * 100
+        text = f'{int(ratio * 100)}%'
+        if speed:
+            text += f' · {fmt_speed(speed)}'
+        self.progress_label.config(text=text)
+
+    def _on_songs(self, payload):
+        tree, songs = payload
+        self._fill_tree(tree, songs)
+
+    def _on_append_songs(self, payload):
+        tree, songs = payload
+        self._append_tree(tree, songs)
+
+    def _on_search_done(self, payload):
+        self.hub.search_busy = False
+        self.more_btn.config(state='normal' if payload else 'disabled')
+
+    def _on_qr_image(self, payload):
+        self._show_qr(*payload)
+
+    def _on_detail_cover(self, payload):
+        win, label, image = payload
+        if win.winfo_exists():
+            photo = ImageTk.PhotoImage(image)
+            win._photo = photo   # 保持引用，避免被回收
+            label.config(image=photo, text='')
+
+    def _on_probe_done(self, payload):
+        win, label, text = payload
+        if win.winfo_exists():
+            label.config(text=text)
+
+    def _on_close_qr(self, payload):
+        payload.destroy()
+
+    def _on_error(self, payload):
+        messagebox.showerror('错误', payload)
 
     def _append_log(self, text):
         self.log_box.config(state='normal')
@@ -514,50 +543,36 @@ class App(tk.Tk):
         if not keyword:
             return
         self._append_log(f'搜索：{keyword}')
-        self._search_keyword = keyword
-        self._search_offset = 0
-        self._search_busy = True
+        self.hub.search_keyword = keyword
+        self.hub.search_offset = 0
+        self.hub.search_busy = True
         self.more_btn.config(state='disabled')
-        self._bg(self._search_worker, keyword, 0, False)
+        self.hub.start(self.hub.search_worker, keyword, 0, False, self.search_tree)
 
     def load_more(self):
-        if not self._search_keyword or self._search_busy:
+        if not self.hub.search_keyword or self.hub.search_busy:
             return
-        self._search_busy = True
+        self.hub.search_busy = True
         self.more_btn.config(state='disabled')
-        self._append_log(f'加载更多（偏移 {self._search_offset}）')
-        self._bg(self._search_worker, self._search_keyword, self._search_offset, True)
+        self._append_log(f'加载更多（偏移 {self.hub.search_offset}）')
+        self.hub.start(self.hub.search_worker, self.hub.search_keyword,
+                       self.hub.search_offset, True, self.search_tree)
 
     def _on_tree_scroll(self, tree, scrollbar, first, last):
         """同步滚动条；搜索列表滑到底部（提前 PRELOAD_ROWS 行）时自动加载下一页。"""
         scrollbar.set(first, last)
         if tree is not getattr(self, 'search_tree', None):
             return
-        if self._search_busy or not self._search_keyword:
+        if self.hub.search_busy or not self.hub.search_keyword:
             return
         if str(self.more_btn['state']) != 'normal':   # 没有更多结果了
             return
-        total = len(tree.get_children())
+        total = len(self.tree_songs.get(tree) or ())   # 行数与歌曲数一致，O(1) 取得
         if total == 0:
             return
         remaining = (1.0 - float(last)) * total          # 视口下方还有多少行
         if remaining <= PRELOAD_ROWS:
             self.load_more()
-
-    def _search_worker(self, keyword, offset, append):
-        try:
-            songs = self.api.search(keyword, limit=PAGE_SIZE, offset=offset)
-            kind = 'append_songs' if append else 'songs'
-            self.msg_queue.put((kind, (self.search_tree, songs)))
-            self._search_offset = offset + len(songs)
-            self.msg_queue.put(('search_done', len(songs) >= PAGE_SIZE))
-            if append:
-                self.msg_queue.put(('log', f'追加 {len(songs)} 首（累计 {self._search_offset}）'))
-            else:
-                self.msg_queue.put(('log', f'共搜索到 {len(songs)} 首'))
-        except Exception as exc:  # noqa: BLE001
-            self.msg_queue.put(('search_done', False))   # 失败也要复位忙碌状态
-            self.msg_queue.put(('log', f'搜索失败：{exc}'))
 
     def _parse_playlist_id(self, text: str) -> str:
         """从歌单 ID 或链接里提取 ID；优先 id= 参数，QQ 链接兼容 /playlist/xxx。"""
@@ -577,18 +592,7 @@ class App(tk.Tk):
             messagebox.showinfo('提示', '请输入歌单 ID 或歌单链接')
             return
         self._append_log(f'加载歌单：{playlist_id}')
-        self._bg(self._playlist_worker, playlist_id)
-
-    def _playlist_worker(self, playlist_id):
-        try:
-            title, songs = self.api.playlist_songs(playlist_id)
-            if not songs:
-                self.msg_queue.put(('log', '歌单为空或加载失败'))
-                return
-            self.msg_queue.put(('songs', (self.playlist_tree, songs)))
-            self.msg_queue.put(('log', f'歌单《{title}》共 {len(songs)} 首'))
-        except Exception as exc:  # noqa: BLE001
-            self.msg_queue.put(('log', f'歌单加载失败：{exc}'))
+        self.hub.start(self.hub.playlist_worker, playlist_id, self.playlist_tree)
 
     # ---------------- 我的歌单 / 我喜欢的音乐 ----------------
     def _require_login(self) -> bool:
@@ -601,13 +605,7 @@ class App(tk.Tk):
     def _load_liked_keys(self):
         """后台拉取「我喜欢的音乐」标识集合，用于列表「喜欢」列。"""
         if self.logged_in:
-            self._bg(self._liked_keys_worker)
-
-    def _liked_keys_worker(self):
-        try:
-            self.msg_queue.put(('liked_keys', (True, self.api.liked_keys())))
-        except Exception as exc:  # noqa: BLE001
-            self.msg_queue.put(('liked_keys', (False, str(exc))))
+            self.hub.start(self.hub.liked_keys_worker)
 
     def _apply_liked_keys(self, payload):
         ok, data = payload
@@ -621,36 +619,22 @@ class App(tk.Tk):
 
     def _refresh_likes(self, tree):
         # 「喜欢」集合未变化时跳过全表重写，避免大列表无谓刷新卡顿
-        key = str(tree)
         snapshot = frozenset(self.liked_keys)
-        if self._liked_snapshot.get(key) == snapshot:
+        if self._liked_snapshot.get(tree) == snapshot:
             return
-        self._liked_snapshot[key] = snapshot
+        self._liked_snapshot[tree] = snapshot
         for iid in tree.get_children():
             song = self._song_at(tree, iid)
             if song is None:
                 continue
-            values = list(tree.item(iid, 'values'))
-            values[8] = '♥' if song_key(song) in snapshot else ''
-            tree.item(iid, values=values)
+            tree.set(iid, 'like', '♥' if song_key(song) in snapshot else '')   # 单格写入，免读改写
 
     def load_liked(self):
         """一键把我喜欢的音乐加载到列表。"""
         if not self._require_login():
             return
         self._append_log('正在获取我喜欢的音乐…')
-        self._bg(self._liked_worker)
-
-    def _liked_worker(self):
-        try:
-            title, songs = self.api.liked_songs()
-            if not songs:
-                self.msg_queue.put(('log', '我喜欢的音乐为空'))
-                return
-            self.msg_queue.put(('songs', (self.playlist_tree, songs)))
-            self.msg_queue.put(('log', f'《{title}》共 {len(songs)} 首'))
-        except Exception as exc:  # noqa: BLE001
-            self.msg_queue.put(('log', f'获取我喜欢的音乐失败：{exc}'))
+        self.hub.start(self.hub.liked_worker, self.playlist_tree)
 
     def open_my_playlists(self):
         """打开「我的歌单」列表窗口，双击或点按钮加载到歌单页。"""
@@ -682,20 +666,14 @@ class App(tk.Tk):
                 return
             win.destroy()
             self._append_log(f'加载我的歌单：{playlist_id}')
-            self._bg(self._playlist_worker, playlist_id)
+            self.hub.start(self.hub.playlist_worker, playlist_id, self.playlist_tree)
 
         ttk.Button(bar, text='加载此歌单', command=load_selected).pack(side='right')
         ttk.Button(bar, text='关闭', command=win.destroy).pack(side='right', padx=6)
         tree.bind('<Double-1>', load_selected)
         self._my_pl_win, self._my_pl_tree, self._my_pl_status = win, tree, status
         self._my_pl_ids = {}
-        self._bg(self._my_playlists_worker)
-
-    def _my_playlists_worker(self):
-        try:
-            self.msg_queue.put(('my_playlists', (True, self.api.user_playlists())))
-        except Exception as exc:  # noqa: BLE001
-            self.msg_queue.put(('my_playlists', (False, str(exc))))
+        self.hub.start(self.hub.my_playlists_worker)
 
     def _show_my_playlists(self, payload):
         ok, data = payload
@@ -724,19 +702,22 @@ class App(tk.Tk):
             index = int(iid) - 1
         except ValueError:
             return None
-        songs = self.tree_songs.get(str(tree), [])
+        songs = self.tree_songs.get(tree, [])
         return songs[index] if 0 <= index < len(songs) else None
 
     def _fill_tree(self, tree, songs):
+        """整表重载（清空后重建），并重置勾选计数与「序号」列排序基准。"""
         tree.delete(*tree.get_children())
-        self.tree_songs[str(tree)] = []
-        self._sort_state.pop(str(tree), None)   # 重新载入后清除排序标记
+        self.tree_songs[tree] = []
+        self._pick_count[tree] = 0
+        self._orig_index.pop(tree, None)
+        self._sort_state.pop(tree, None)   # 重新载入后清除排序标记
         self._append_tree(tree, songs)
 
     def _append_tree(self, tree, songs):
         """追加歌曲；自动跳过已存在的重复项（去重）。"""
         level = self.cfg.get('level', 'exhigh')
-        existing = self.tree_songs.get(str(tree), [])
+        existing = self.tree_songs.get(tree, [])
         seen = {song_key(song) for song in existing}
         added = []
         for song in songs:
@@ -745,14 +726,18 @@ class App(tk.Tk):
                 continue
             seen.add(key)
             added.append(song)
-        for index, song in enumerate(added, len(existing) + 1):
+        origin = self._orig_index.setdefault(tree, {})
+        for offset, song in enumerate(added):
+            index = len(existing) + offset + 1
+            key = song_key(song)
+            origin.setdefault(key, index)   # 记录原始载入序号，供「序号」列排序
             mark = 'VIP' if song.fee in (1, 4) else ''
             tree.insert('', 'end', iid=str(index),
-                        values=('☐', index, song.name, song.artists,
+                        values=(UNPICK_MARK, index, song.name, song.artists,
                                 song.album, song.duration_str,
                                 song.size_hint(level), mark,
-                                '♥' if song_key(song) in self.liked_keys else ''))
-        self.tree_songs[str(tree)] = existing + added
+                                '♥' if key in self.liked_keys else ''))
+        self.tree_songs[tree] = existing + added   # 新追加的行都未勾选，计数不变
         self._update_pick_label(tree)
         skipped = len(songs) - len(added)
         if skipped:
@@ -760,7 +745,7 @@ class App(tk.Tk):
 
     def _dedupe_tree(self, tree):
         """按歌曲标识去重并重建列表。"""
-        songs = self.tree_songs.get(str(tree), [])
+        songs = self.tree_songs.get(tree, [])
         if not songs:
             return
         seen = set()
@@ -779,21 +764,22 @@ class App(tk.Tk):
 
     # ---------------- 排序 ----------------
     def _sort_tree(self, tree, column):
-        """点击表头排序：首次升序，再点切换倒序。"""
-        if not self.tree_songs.get(str(tree)):
-            return
-        key = str(tree)
-        prev_column, prev_reverse = self._sort_state.get(key, (None, False))
-        reverse = not prev_reverse if prev_column == column else False
-        self._sort_state[key] = (column, reverse)
-        level = self.cfg.get('level', 'exhigh')
+        """点击表头排序：首次升序，再点切换倒序。
 
-        def sort_key(iid):
-            song = self._song_at(tree, iid)
-            if song is None:
-                return 0
+        按歌曲（而非行位置）排序后整表重建：保留每行原有的勾选 / 喜欢等列值，
+        只需 n 次 item 读 + n 次 insert，比「逐行 move + 逐行改写序号」少约三分之一 Tk 调用。
+        """
+        songs = self.tree_songs.get(tree) or []
+        if not songs:
+            return
+        prev_column, prev_reverse = self._sort_state.get(tree, (None, False))
+        reverse = not prev_reverse if prev_column == column else False
+        level = self.cfg.get('level', 'exhigh')
+        origin = self._orig_index.get(tree, {})
+
+        def sort_key(song):
             if column == 'idx':
-                return int(iid)   # 按原始载入顺序
+                return origin.get(song_key(song), 0)   # 按原始载入顺序
             if column == 'name':
                 return song.name.lower()
             if column == 'artist':
@@ -810,21 +796,29 @@ class App(tk.Tk):
                 return 1 if song_key(song) in self.liked_keys else 0
             return 0
 
-        ordered = sorted(tree.get_children(), key=sort_key, reverse=reverse)
-        for position, iid in enumerate(ordered):
-            tree.move(iid, '', position)
-        self._renumber(tree)
+        ordered = sorted(songs, key=sort_key, reverse=reverse)
+        # 先按歌曲标识取出各行的完整列值（含勾选 / 喜欢），重建时原样写回
+        rows = {}
+        for iid in tree.get_children():
+            song = self._song_at(tree, iid)
+            if song is not None:
+                rows[song_key(song)] = tree.item(iid, 'values')
+        tree.delete(*tree.get_children())
+        for index, song in enumerate(ordered, 1):
+            values = list(rows.get(song_key(song)) or ())
+            if len(values) < len(COLUMNS):   # 兜底：行值缺失时按当前配置补全
+                values = [UNPICK_MARK, index, song.name, song.artists, song.album,
+                          song.duration_str, song.size_hint(level),
+                          'VIP' if song.fee in (1, 4) else '',
+                          '♥' if song_key(song) in self.liked_keys else '']
+            values[COL['idx']] = index
+            tree.insert('', 'end', iid=str(index), values=values)
+        self.tree_songs[tree] = ordered
+        self._sort_state[tree] = (column, reverse)
         self._update_headers(tree)
 
-    def _renumber(self, tree):
-        """让「序号」列始终等于当前视觉顺序。"""
-        for position, iid in enumerate(tree.get_children(), 1):
-            values = list(tree.item(iid, 'values'))
-            values[1] = position
-            tree.item(iid, values=values)
-
     def _update_headers(self, tree):
-        column, reverse = self._sort_state.get(str(tree), (None, False))
+        column, reverse = self._sort_state.get(tree, (None, False))
         for col, label in HEAD_LABELS.items():
             if col == 'pick':
                 continue
@@ -835,41 +829,44 @@ class App(tk.Tk):
         """点击「选」列切换勾选状态。"""
         if event is None or tree.identify_region(event.x, event.y) != 'cell':
             return
-        if tree.identify_column(event.x) != '#1':   # 第 1 列即勾选列
+        if tree.identify_column(event.x) != f'#{COL["pick"] + 1}':   # 勾选列
             return
         iid = tree.identify_row(event.y)
         if not iid:
             return
-        values = list(tree.item(iid, 'values'))
-        values[0] = '☑' if values[0] != '☑' else '☐'
-        tree.item(iid, values=values)
+        mark = UNPICK_MARK if tree.set(iid, 'pick') == PICK_MARK else PICK_MARK
+        self._set_pick(tree, iid, mark)
+
+    def _set_pick(self, tree, iid, mark):
+        """写入单行勾选状态，并增量维护已选计数（避免全表统计）。"""
+        if tree.set(iid, 'pick') == mark:
+            return
+        tree.set(iid, 'pick', mark)
+        self._pick_count[tree] = self._pick_count.get(tree, 0) + (1 if mark == PICK_MARK else -1)
         self._update_pick_label(tree)
 
     def _set_all_pick(self, tree, picked):
-        mark = '☑' if picked else '☐'
+        mark = PICK_MARK if picked else UNPICK_MARK
         for iid in tree.get_children():
-            values = list(tree.item(iid, 'values'))
-            values[0] = mark
-            tree.item(iid, values=values)
+            tree.set(iid, 'pick', mark)
+        self._pick_count[tree] = len(tree.get_children()) if picked else 0
         self._update_pick_label(tree)
 
     def _picked_songs(self, tree):
         """返回勾选的歌曲；没勾选时回退到高亮选中的行。"""
         result = [song for iid in tree.get_children()
                   if (song := self._song_at(tree, iid)) is not None
-                  and (tree.item(iid, 'values') or [''])[0] == '☑']
+                  and tree.set(iid, 'pick') == PICK_MARK]
         if result:
             return result
         return [song for iid in tree.selection()
                 if (song := self._song_at(tree, iid)) is not None]
 
     def _update_pick_label(self, tree):
-        label = self.pick_labels.get(str(tree))
+        label = self.pick_labels.get(tree)
         if label is None:
             return
-        count = sum(1 for iid in tree.get_children()
-                    if tree.item(iid, 'values') and tree.item(iid, 'values')[0] == '☑')
-        label.config(text=f'已选 {count} 首')
+        label.config(text=f'已选 {self._pick_count.get(tree, 0)} 首')
 
     def _active_tree(self):
         index = self.nb.index(self.nb.select())
@@ -881,10 +878,8 @@ class App(tk.Tk):
 
     # ---------------- 右键菜单 / 详情 ----------------
     def _toggle_one(self, tree, iid):
-        values = list(tree.item(iid, 'values'))
-        values[0] = '☐' if values[0] == '☑' else '☑'
-        tree.item(iid, values=values)
-        self._update_pick_label(tree)
+        mark = UNPICK_MARK if tree.set(iid, 'pick') == PICK_MARK else PICK_MARK
+        self._set_pick(tree, iid, mark)
 
     def _copy_text(self, text):
         self.clipboard_clear()
@@ -893,7 +888,7 @@ class App(tk.Tk):
 
     def _open_detail_at(self, tree, event):
         """双击行（非勾选列）打开详情。"""
-        if tree.identify_column(event.x) == '#1':
+        if tree.identify_column(event.x) == f'#{COL["pick"] + 1}':
             return
         iid = tree.identify_row(event.y)
         song = self._song_at(tree, iid) if iid else None
@@ -911,7 +906,7 @@ class App(tk.Tk):
         menu = tk.Menu(self, tearoff=0)
         menu.add_command(label='下载此曲', command=lambda: self._start_download([song]))
         menu.add_command(label='查看详情', command=lambda: self.open_detail(song))
-        checked = (tree.item(iid, 'values') or ['☐'])[0] == '☑'
+        checked = tree.set(iid, 'pick') == PICK_MARK
         menu.add_command(label='取消勾选' if checked else '勾选此曲',
                          command=lambda: self._toggle_one(tree, iid))
         menu.add_separator()
@@ -955,35 +950,12 @@ class App(tk.Tk):
         probe_label = ttk.Label(right, text='', justify='left')
         probe_label.pack(anchor='w', pady=(12, 0))
         ttk.Button(right, text='检测可用音质',
-                   command=lambda: self._bg(self._probe_qualities, song, probe_label, win)).pack(
+                   command=lambda: self.hub.start(self.hub.probe_qualities, song,
+                                                  probe_label, win)).pack(
             anchor='w', pady=10)
         ttk.Button(right, text='下载此曲',
                    command=lambda: self._start_download([song])).pack(anchor='w')
-        self._bg(self._load_cover, song, cover_label, win)
-
-    def _load_cover(self, song, label, win):
-        image = None
-        try:
-            if song.cover_url:
-                resp = requests.get(song.cover_url, timeout=15)
-                image = Image.open(io.BytesIO(resp.content)).convert('RGB').resize((300, 300))
-        except Exception as exc:  # noqa: BLE001
-            self.msg_queue.put(('log', f'封面加载失败：{exc}'))
-        if image is None:
-            self.msg_queue.put(('probe_done', (win, label, '（无封面）')))
-            return
-        self.msg_queue.put(('detail_cover', (win, label, image)))
-
-    def _probe_qualities(self, song, label, win):
-        rows = []
-        for level, level_label in LEVELS_BY_SOURCE.get(song.source, LEVELS_BY_SOURCE['netease']):
-            try:
-                info = self.api.song_url(song, level, self.cfg.get('encode_type', 'mp3'))
-                detail = f"{info.get('type', '').upper()} {human_size(info.get('size'))}"
-                rows.append(f'{level_label}：可用（{detail}）')
-            except Exception:  # noqa: BLE001 - 探测失败即视为不可用
-                rows.append(f'{level_label}：不可用')
-        self.msg_queue.put(('probe_done', (win, label, '\n'.join(rows))))
+        self.hub.start(self.hub.load_cover, song, cover_label, win)
 
     # ---------------- 下载 ----------------
     def download_selected(self):
@@ -996,7 +968,7 @@ class App(tk.Tk):
         tree = self._active_tree()
         if tree is None:
             return
-        self._start_download(list(self.tree_songs.get(str(tree), [])))
+        self._start_download(list(self.tree_songs.get(tree, [])))
 
     def _start_download(self, songs):
         if self._downloading:
@@ -1074,71 +1046,9 @@ class App(tk.Tk):
             self._dl_control = Control()
             self._downloading = True
             self._sync_download_buttons()
-            self._bg(self._download_worker, songs, level, options, self._dl_control)
+            self.hub.start(self.hub.download_worker, songs, level, options, self._dl_control)
 
         ttk.Button(win, text='开始下载', command=confirm).pack(pady=14)
-
-    def _download_worker(self, songs, level=None, options=None, control=None):
-        """多线程并发下载：线程数取自配置 workers（1~8）。
-
-        - 取址等接口调用在 Downloader 内部串行，下载传输并行
-        - ProgressHub 聚合整体进度与瞬时速度，UI 每秒最多刷新约 5 次
-        - 暂停 / 取消对所有下载线程同时生效
-        """
-        control = control or Control()
-        workers = max(1, min(8, int(self.cfg.get('workers', 3))))
-        downloader = Downloader(
-            self.api, self.cfg,
-            on_log=lambda text: self.msg_queue.put(('log', text)),
-            control=control,
-        )
-        total = len(songs)
-        hub = ProgressHub(total, lambda ratio, speed:
-                          self.msg_queue.put(('progress', (ratio, speed))))
-        state = {'success': 0, 'failed': [], 'cancelled': False, 'done': 0}
-        lock = threading.Lock()
-
-        def task(index, song):
-            control.wait_if_paused()
-            if control.cancelled:
-                raise DownloadCancelled()
-            self.msg_queue.put(('log', f'[{index + 1}/{total}] {song.name} - {song.artists}'))
-            try:
-                downloader.download(song, level=level, options=options,
-                                     on_progress=lambda r, d, t, _i=index: hub.update(_i, r, d))
-                with lock:
-                    state['success'] += 1
-            except DownloadCancelled:
-                with lock:
-                    state['cancelled'] = True
-                raise
-            except Exception as exc:  # noqa: BLE001
-                with lock:
-                    state['failed'].append((song, str(exc)))
-                self.msg_queue.put(('log', f'  失败：{song.name} - {exc}'))
-            finally:
-                hub.finish(index)   # 无论成功 / 失败，该格都记满，保证整体进度单调
-                with lock:
-                    state['done'] += 1
-                    done_count = state['done']
-                self.msg_queue.put(('status', f'已完成 {done_count}/{total} · 并发 {workers} 线程'))
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers,
-                                                   thread_name_prefix='dl') as pool:
-            futures = [pool.submit(task, i, song) for i, song in enumerate(songs)]
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    future.result()
-                except DownloadCancelled:
-                    pass   # 已在 task 内标记，未开始的任务也会快速退出
-                except Exception:  # noqa: BLE001 - 已在 task 内记录
-                    pass
-        hub.final()
-        # 收尾一律回到界面线程处理（含取消后的清理询问）
-        self.msg_queue.put(('download_end', {
-            'total': total, 'success': state['success'], 'failed': state['failed'],
-            'cancelled': state['cancelled'], 'downloader': downloader,
-        }))
 
     def _finish_download(self, payload):
         self._downloading = False
@@ -1160,6 +1070,8 @@ class App(tk.Tk):
             self._append_log(f'  失败清单：{song.name} - {song.artists}（{reason}）')
         if payload['cancelled']:
             self._cleanup_after_cancel(payload['downloader'])
+        elif success and self.cfg.get('open_dir_after_download'):
+            self._open_download_dir()   # 设置项开启时，下载成功后自动打开下载目录
 
     def _cleanup_after_cancel(self, downloader):
         """取消后按设置处理本次产生的文件（未完成的 .part 与已下载的音频/歌词）。"""
@@ -1181,32 +1093,6 @@ class App(tk.Tk):
         self._append_log(f'已删除取消下载产生的 {removed} 个文件')
 
     # ---------------- 登录 ----------------
-    def _check_account(self):
-        source = self.cfg.get('source', 'netease')
-        if source == 'netease' and self.cfg.get('use_anonimous') and not self.cfg.get('cookie'):
-            try:
-                self.api.register_anonimous()
-                self.msg_queue.put(('log', '匿名注册成功（已获取匿名 token）'))
-            except Exception as exc:  # noqa: BLE001
-                self.msg_queue.put(('log', f'匿名注册失败（不影响使用）：{exc}'))
-        try:
-            profile = self.api.account()
-        except Exception as exc:  # noqa: BLE001
-            self.msg_queue.put(('log', f'账号校验失败：{exc}'))
-            profile = None
-        image = self._fetch_avatar(profile.get('avatarUrl')) if (profile and source == 'netease') else None
-        self.msg_queue.put(('account', (profile, image)))
-
-    def _fetch_avatar(self, url):
-        """拉取头像缩略图；失败不影响登录信息展示。"""
-        if not url:
-            return None
-        try:
-            resp = self.api.session.get(url + '?param=64y64', timeout=10)
-            return Image.open(io.BytesIO(resp.content)).convert('RGB').resize((36, 36))
-        except Exception:  # noqa: BLE001
-            return None
-
     def _show_account(self, payload):
         profile, image = payload if isinstance(payload, tuple) else (payload, None)
         source = self.cfg.get('source', 'netease')
@@ -1239,13 +1125,13 @@ class App(tk.Tk):
         save_config(self.cfg)
         self.api.set_cookie(cookie)
         self._append_log('网易云登录成功，Cookie 已写入 config.json')
-        self._bg(self._check_account)
+        self.hub.start(self.hub.check_account)
 
-    def _on_qq_login(self):
+    def _on_qq_login(self, _payload=None):
         self.cfg['qq_credential'] = self.api.credential_dict()
         save_config(self.cfg)
         self._append_log('QQ 音乐登录成功，凭证已写入 config.json')
-        self._bg(self._check_account)
+        self.hub.start(self.hub.check_account)
 
     def do_logout(self):
         source = self.cfg.get('source', 'netease')
@@ -1310,17 +1196,9 @@ class App(tk.Tk):
                 messagebox.showinfo('提示', 'Cookie 不能为空', parent=win)
                 return
             win.destroy()
-            self._bg(self._qq_cookie_apply, cookie)
+            self.hub.start(self.hub.qq_cookie_apply, cookie)
 
         ttk.Button(win, text='登录', command=apply).pack(pady=10)
-
-    def _qq_cookie_apply(self, cookie):
-        try:
-            self.api.set_cookie(cookie)
-        except Exception as exc:  # noqa: BLE001
-            self.msg_queue.put(('error', f'QQ 音乐登录失败：{exc}'))
-            return
-        self._on_qq_login()
 
     # ---------------- 扫码登录 ----------------
     def open_qr_login(self):
@@ -1336,45 +1214,13 @@ class App(tk.Tk):
         win.transient(self)
         label = ttk.Label(win, text='正在获取二维码…')
         label.pack(expand=True)
-        self._qr_stop = False
+        self.hub.qr_stop = False
         win.protocol('WM_DELETE_WINDOW', lambda: self._stop_qr(win))
-        self._bg(self._qr_worker, win, label)
+        self.hub.start(self.hub.qr_worker, win, label)
 
     def _stop_qr(self, win):
-        self._qr_stop = True
+        self.hub.qr_stop = True
         win.destroy()
-
-    def _qr_worker(self, win, label):
-        try:
-            unikey = self.api.qrcode_unikey()
-        except Exception as exc:  # noqa: BLE001
-            self.msg_queue.put(('log', f'获取二维码失败：{exc}'))
-            return
-        if not unikey:
-            self.msg_queue.put(('log', '获取二维码失败：unikey 为空'))
-            return
-        image = qrcode.make(f'https://music.163.com/login?codekey={unikey}').convert('RGB')
-        self.msg_queue.put(('qr_image', (win, label, image)))
-
-        deadline = time.time() + 180
-        while not self._qr_stop and time.time() < deadline:
-            time.sleep(2)
-            try:
-                result = self.api.qrcode_check(unikey)
-            except Exception as exc:  # noqa: BLE001
-                self.msg_queue.put(('log', f'轮询失败：{exc}'))
-                continue
-            code = result.get('code')
-            if code == 800:
-                self.msg_queue.put(('log', '二维码已过期，请重新获取'))
-                return
-            if code == 802:
-                self.msg_queue.put(('status', '已扫码，请在手机上确认'))
-            elif code == 803:
-                cookie = result.get('cookie') or self.api.cookie_str()
-                self.msg_queue.put(('login_ok', cookie))
-                self.msg_queue.put(('close_qr', win))
-                return
 
     def _open_qq_qr_login(self):
         win = tk.Toplevel(self)
@@ -1408,46 +1254,12 @@ class App(tk.Tk):
             win._session = session
             label.config(text='正在获取二维码…', image='')
             hint.config(text='')
-            self._bg(self._qq_qr_worker, win, label, hint, session, type_labels[type_var.get()])
+            self.hub.start(self.hub.qq_qr_worker, win, label, hint, session,
+                           type_labels[type_var.get()])
 
         box.bind('<<ComboboxSelected>>', refresh)
         win.protocol('WM_DELETE_WINDOW', stop)
         refresh()
-
-    def _qq_qr_worker(self, win, label, hint, session, login_type):
-        if session['stop'] or not win.winfo_exists():
-            return
-        try:
-            data, _identifier = self.api.qr_login_start(login_type)
-        except Exception as exc:  # noqa: BLE001
-            self.msg_queue.put(('log', f'获取二维码失败：{exc}'))
-            return
-        try:
-            image = Image.open(io.BytesIO(data)).convert('RGB')
-        except Exception as exc:  # noqa: BLE001
-            self.msg_queue.put(('log', f'二维码图片解析失败：{exc}'))
-            return
-        self.msg_queue.put(('qr_image', (win, label, image)))
-
-        deadline = time.time() + 180
-        while not session['stop'] and time.time() < deadline:
-            time.sleep(2)
-            if session['stop'] or not win.winfo_exists():
-                return
-            try:
-                event, note = self.api.qr_login_poll()
-            except Exception as exc:  # noqa: BLE001
-                self.msg_queue.put(('log', f'轮询失败：{exc}'))
-                continue
-            if event in ('scan', 'conf'):
-                self.msg_queue.put(('probe_done', (win, hint, note)))
-            elif event == 'done':
-                self.msg_queue.put(('qq_login_ok', None))
-                self.msg_queue.put(('close_qr', win))
-                return
-            elif event in ('timeout', 'refuse'):
-                self.msg_queue.put(('probe_done', (win, hint, note)))
-                return
 
     def _show_qr(self, win, label, image):
         photo = ImageTk.PhotoImage(image)
@@ -1468,20 +1280,137 @@ class App(tk.Tk):
         self.cfg['workers'] = max(1, min(8, int(self.workers_var.get())))
         self.cfg['cancel_cleanup'] = LABEL_CANCEL_CLEANUP.get(
             self.cancel_cleanup_var.get(), 'ask')
+        self.cfg['open_dir_after_download'] = bool(self.open_dir_var.get())
         save_config(self.cfg)
         self._append_log('设置已保存')
+
+    # ---------------- 高级密钥 ----------------
+    def _open_keys_dialog(self):
+        """密钥对话框：weapi 加密密钥（即时生效）+ API 凭证（当前未启用）。"""
+        win = tk.Toplevel(self)
+        win.title('加密密钥与 API 凭证')
+        win.geometry('660x520')
+        win.transient(self)
+        win.grab_set()
+        nb = ttk.Notebook(win)
+        nb.pack(fill='both', expand=True, padx=10, pady=10)
+        self._build_weapi_keys_page(nb, win)
+        self._build_credentials_page(nb, win)
+        ttk.Button(win, text='关闭', command=win.destroy).pack(pady=(0, 12))
+
+    def _keys_field(self, parent, row, label, value, height=None):
+        """一行密钥输入；height 给定时改用多行 Text（长 hex / PEM 需换行显示）。"""
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky='nw', pady=6, padx=(0, 8))
+        holder = ttk.Frame(parent)
+        holder.grid(row=row, column=1, sticky='ew', pady=6)
+        if height is None:
+            var = tk.StringVar(value=value)
+            ttk.Entry(holder, textvariable=var).pack(side='left', fill='x', expand=True)
+            return var
+        text = tk.Text(holder, height=height, wrap='char')
+        bar = ttk.Scrollbar(holder, orient='vertical', command=text.yview)
+        text.configure(yscrollcommand=bar.set)
+        bar.pack(side='right', fill='y')
+        text.pack(side='left', fill='both', expand=True)
+        text.insert('1.0', value)
+        return text
+
+    def _build_weapi_keys_page(self, nb, win):
+        page = ttk.Frame(nb, padding=12)
+        nb.add(page, text='weapi 加密密钥（生效）')
+        page.columnconfigure(1, weight=1)
+        keys = WEApiKeys.from_config(self.cfg.get('weapi_keys'))
+        self._weapi_vars = {
+            'key1': self._keys_field(page, 0, 'key1', keys.key1),
+            'iv': self._keys_field(page, 1, 'iv', keys.iv),
+            'pub_key': self._keys_field(page, 2, 'pub_key', keys.pub_key),
+            'modulus': self._keys_field(page, 3, 'modulus', keys.modulus, height=6),
+        }
+        ttk.Label(page, text='仅影响 /weapi/* 加密接口（歌曲详情、歌单、取址、歌词）；'
+                             '填错会导致这些请求全部失败。',
+                  foreground='#666', wraplength=520, justify='left').grid(
+            row=4, column=0, columnspan=2, sticky='w', pady=(14, 0))
+        bar = ttk.Frame(page)
+        bar.grid(row=5, column=1, sticky='w', pady=12)
+        ttk.Button(bar, text='保存并生效',
+                   command=lambda: self._save_weapi_keys(win)).pack(side='left')
+        ttk.Button(bar, text='校验',
+                   command=lambda: self._check_weapi_keys(win)).pack(side='left', padx=6)
+        ttk.Button(bar, text='恢复默认值', command=self._reset_weapi_keys).pack(side='left')
+
+    def _collect_fields(self, widgets) -> dict:
+        """读取一组输入控件（Entry 取 StringVar，Text 取内容）。"""
+        data = {}
+        for name, widget in widgets.items():
+            data[name] = (widget.get('1.0', 'end').strip() if isinstance(widget, tk.Text)
+                          else widget.get().strip())
+        return data
+
+    def _check_weapi_keys(self, win=None):
+        """校验当前填写的密钥；不合法时弹窗提示并返回 None。"""
+        keys = WEApiKeys.from_config(self._collect_fields(self._weapi_vars))
+        error = keys.validate()
+        if error:
+            messagebox.showerror('密钥无效', error, parent=win or self)
+            return None
+        return keys
+
+    def _save_weapi_keys(self, win=None):
+        keys = self._check_weapi_keys(win)
+        if keys is None:
+            return
+        self.cfg['weapi_keys'] = keys.to_dict()
+        save_config(self.cfg)
+        apply_weapi_keys(self.cfg)   # 只更新已缓存实例，保留登录态与匿名 token
+        self._append_log('weapi 密钥已更新并生效')
+        messagebox.showinfo('提示', 'weapi 密钥已保存并生效', parent=win or self)
+
+    def _reset_weapi_keys(self):
+        defaults = WEApiKeys()
+        for name, widget in self._weapi_vars.items():
+            value = getattr(defaults, name)
+            if isinstance(widget, tk.Text):
+                widget.delete('1.0', 'end')
+                widget.insert('1.0', value)
+            else:
+                widget.set(value)
+
+    def _build_credentials_page(self, nb, win):
+        page = ttk.Frame(nb, padding=12)
+        nb.add(page, text='API 凭证（未启用）')
+        page.columnconfigure(1, weight=1)
+        ttk.Label(page, text='本组凭证当前不参与任何请求，仅为留档与后续扩展保留；'
+                             '填入不会改变下载行为。',
+                  foreground='#c00', wraplength=540, justify='left').grid(
+            row=0, column=0, columnspan=2, sticky='w', pady=(0, 10))
+        cred = self.cfg.get('credentials')
+        cred = cred if isinstance(cred, dict) else {}
+        self._cred_vars = {
+            'app_id': self._keys_field(page, 1, 'app_id', str(cred.get('app_id') or '')),
+            'app_secret': self._keys_field(page, 2, 'app_secret', str(cred.get('app_secret') or '')),
+            'pub_key': self._keys_field(page, 3, 'pub_key', str(cred.get('pub_key') or ''), height=7),
+            'private_key': self._keys_field(page, 4, 'private_key',
+                                            str(cred.get('private_key') or ''), height=7),
+        }
+        ttk.Button(page, text='保存', command=lambda: self._save_credentials(win)).grid(
+            row=5, column=1, sticky='w', pady=12)
+
+    def _save_credentials(self, win=None):
+        cred = dict(self.cfg.get('credentials') or {})
+        cred.update(self._collect_fields(self._cred_vars))
+        self.cfg['credentials'] = cred
+        save_config(self.cfg)
+        self._append_log('API 凭证已保存（当前不参与任何请求）')
+        messagebox.showinfo('提示', 'API 凭证已保存（当前不参与任何请求）', parent=win or self)
 
     def _refresh_sizes(self, tree, level=None):
         level = level or self.cfg.get('level', 'exhigh')
         # 音质未变化时跳过全表重算，避免每次切换音源 / 刷新都重写整张表
-        key = str(tree)
-        if self._size_level.get(key) == level:
+        if self._size_level.get(tree) == level:
             return
-        self._size_level[key] = level
+        self._size_level[tree] = level
         for iid in tree.get_children():
             song = self._song_at(tree, iid)
             if song is None:
                 continue
-            values = list(tree.item(iid, 'values'))
-            values[6] = song.size_hint(level)
-            tree.item(iid, values=values)
+            tree.set(iid, 'size', song.size_hint(level))   # 单格写入，免读改写
